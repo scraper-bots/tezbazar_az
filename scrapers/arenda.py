@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional, Set
 from bs4 import BeautifulSoup
 import asyncio
 import aiohttp
@@ -17,31 +17,60 @@ class ArendaScraper(BaseScraper):
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
             'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
-        
-    async def fetch_page(self, page: int) -> List[Dict]:
+        self.leads_batch = []
+        self.batch_size = 25  # Increased batch size
+        self.processed_ids: Set[str] = set()  # Track processed listings
+
+    async def get_page_count(self, session) -> int:
+        """Get total number of pages"""
+        try:
+            async with session.get(self.search_url) as response:
+                html = await self.decode_response(await response.read())
+                soup = BeautifulSoup(html, 'html.parser')
+                pagination = soup.select('div.pagination a')
+                if pagination:
+                    page_numbers = [
+                        int(a.text.strip()) 
+                        for a in pagination 
+                        if a.text.strip().isdigit()
+                    ]
+                    return max(page_numbers) if page_numbers else 3
+                return 3
+        except Exception as e:
+            logger.error(f"Error getting page count: {str(e)}")
+            return 3
+
+    async def decode_response(self, raw_bytes: bytes) -> str:
+        """Decode response with proper encoding handling"""
+        encodings = ['utf-8', 'windows-1251', 'utf-8-sig', 'ascii']
+        for encoding in encodings:
+            try:
+                return raw_bytes.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+        return raw_bytes.decode('utf-8', errors='ignore')
+
+    async def fetch_listings(self, session: aiohttp.ClientSession, page: int) -> List[Dict]:
+        """Fetch listings from a single page"""
         params = {
             'home_search': '1',
             'lang': '1',
             'site': '1',
             'home_s': '1',
-            'price_min': '',
-            'price_max': '',
-            'axtar': '',
-            'sahe_min': '',
-            'sahe_max': '',
-            'mertebe_min': '',
-            'mertebe_max': '',
-            'y_mertebe_min': '',
-            'y_mertebe_max': '',
-            'page': page
+            'page': str(page)
         }
         
-        async with aiohttp.ClientSession(headers=self.session.headers) as session:
+        try:
             async with session.get(self.search_url, params=params) as response:
-                html = await response.text()
-                return self.parse_listing_page(html)
+                html = await self.decode_response(await response.read())
+                listings = self.parse_listing_page(html)
+                logger.info(f"Found {len(listings)} listings on page {page}")
+                return listings
+        except Exception as e:
+            logger.error(f"Error fetching page {page}: {str(e)}")
+            return []
 
     def parse_listing_page(self, html: str) -> List[Dict]:
         soup = BeautifulSoup(html, 'html.parser')
@@ -49,127 +78,161 @@ class ArendaScraper(BaseScraper):
         
         for item in soup.select('li.new_elan_box'):
             try:
+                link_elem = item.select_one('a')
+                if not link_elem:
+                    continue
+
+                listing_id = item.get('id', '').replace('elan_', '')
+                if listing_id in self.processed_ids:
+                    continue
+
+                self.processed_ids.add(listing_id)
                 listing = {
-                    'id': item.get('id', '').replace('elan_', ''),
-                    'link': self.base_url + item.select_one('a')['href'],
-                    'title': item.select_one('.elan_property_title').text.strip(),
-                    'price': self.extract_price(item.select_one('.elan_price').text),
-                    'location': item.select_one('.elan_unvan').text.strip(),
-                    'date': item.select_one('.elan_box_date').text.strip()
+                    'id': listing_id,
+                    'link': self.base_url + link_elem.get('href', ''),
+                    'title': ' '.join([elem.text.strip() for elem in item.select('.elan_property_title')]),
+                    'price': self.extract_price(item.select_one('.elan_price').text.strip() if item.select_one('.elan_price') else ''),
+                    'location': item.select_one('.elan_unvan').text.strip() if item.select_one('.elan_unvan') else '',
+                    'date': item.select_one('.elan_box_date').text.strip() if item.select_one('.elan_box_date') else '',
+                    'details': self.parse_property_details(item)
                 }
-                
-                # Extract property details
-                params = {}
-                for row in item.select('.n_elan_box_botom_params tr td'):
-                    text = row.text.strip()
-                    if 'otaqlı' in text:
-                        params['rooms'] = text.replace('otaqlı', '').strip()
-                    elif 'm²' in text:
-                        params['area'] = text.replace('m²', '').strip()
-                    elif 'mərtəbə' in text:
-                        params['floor'] = text.strip()
-                
-                listing['details'] = params
                 listings.append(listing)
             except Exception as e:
                 logger.error(f"Error parsing listing: {str(e)}")
                 
         return listings
 
-    async def fetch_listing_details(self, url: str) -> Dict:
-        async with aiohttp.ClientSession(headers=self.session.headers) as session:
+    def parse_property_details(self, item: BeautifulSoup) -> Dict:
+        """Extract property details from listing item"""
+        details = {}
+        try:
+            params_table = item.select_one('.n_elan_box_botom_params')
+            if params_table:
+                for cell in params_table.select('td'):
+                    text = cell.text.strip()
+                    if 'otaqlı' in text:
+                        details['rooms'] = text.split()[0]
+                    elif 'm²' in text:
+                        details['area'] = text.replace('m²', '').strip()
+                    elif 'mərtəbə' in text:
+                        details['floor'] = text
+        except Exception as e:
+            logger.error(f"Error parsing property details: {str(e)}")
+        return details
+
+    async def fetch_details(self, session: aiohttp.ClientSession, url: str) -> Optional[Dict]:
+        """Fetch details for a single listing"""
+        try:
+            # Ensure URL is properly formatted
+            if url.startswith('https://arenda.azhttps://'):
+                url = url.replace('https://arenda.azhttps://', 'https://')
+            elif not url.startswith('http'):
+                url = 'https://' + url.lstrip('/')
+            
             async with session.get(url) as response:
-                html = await response.text()
+                if response.status != 200:
+                    logger.error(f"Error fetching {url}: Status {response.status}")
+                    return None
+                html = await self.decode_response(await response.read())
                 return self.parse_listing_details(html)
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout fetching details from {url}")
+            return None
+        except Exception as e:
+            logger.error(f"Error fetching details from {url}: {str(e)}")
+            return None
 
     def parse_listing_details(self, html: str) -> Dict:
         soup = BeautifulSoup(html, 'html.parser')
         details = {}
         
         try:
-            # Extract contact info
             user_info = soup.select_one('.new_elan_user_info')
             if user_info:
-                details['name'] = user_info.select_one('p').text.strip()
-                phones = []
-                for phone in user_info.select('.elan_in_tel'):
-                    phone_number = phone.text.strip()
-                    if phone_number:
-                        phones.append(self.clean_phone_number(phone_number))
-                details['phones'] = phones
+                details['name'] = user_info.select_one('p').text.strip() if user_info.select_one('p') else ''
+                details['phones'] = [
+                    self.clean_phone_number(phone.text.strip())
+                    for phone in user_info.select('.elan_in_tel')
+                    if phone.text.strip()
+                ]
 
-            # Extract property features
-            features = []
-            for feature in soup.select('.property_lists li'):
-                features.append(feature.text.strip())
-            details['features'] = features
+            details['features'] = [
+                feature.text.strip()
+                for feature in soup.select('.property_lists li')
+            ]
 
-            # Extract description
-            description = soup.select_one('.elan_info_txt')
-            if description:
-                details['description'] = description.text.strip()
+            if desc_elem := soup.select_one('.elan_info_txt'):
+                details['description'] = desc_elem.text.strip()
+
+            if addr_elem := soup.select_one('.elan_unvan_txt'):
+                details['address'] = addr_elem.text.strip()
 
         except Exception as e:
-            logger.error(f"Error parsing listing details: {str(e)}")
+            logger.error(f"Error parsing details: {str(e)}")
 
         return details
 
     def clean_phone_number(self, phone: str) -> str:
-        """Clean and format phone number"""
         phone = ''.join(filter(str.isdigit, phone))
-        if phone.startswith('0'):
-            phone = '+994' + phone[1:]
-        return phone
+        if len(phone) >= 9:
+            if phone.startswith('994'):
+                return '+' + phone
+            elif phone.startswith('0'):
+                return '+994' + phone[1:]
+            return '+994' + phone
+        return ''
 
     def extract_price(self, price_text: str) -> Dict:
-        """Extract price and currency from price text"""
+        """Extract and normalize price information"""
+        default_return = {'amount': 0, 'currency': 'AZN'}
         try:
-            amount = ''.join(filter(str.isdigit, price_text))
-            currency = 'AZN' if 'AZN' in price_text else ''
+            # Remove all non-digit characters except decimal point
+            amount_str = ''.join(filter(lambda x: x.isdigit() or x == '.', price_text))
+            if not amount_str:
+                return default_return
+            
+            try:
+                amount = float(amount_str)
+            except ValueError:
+                return default_return
+
             return {
-                'amount': int(amount) if amount else 0,
-                'currency': currency
+                'amount': amount,
+                'currency': 'AZN' if 'AZN' in price_text else ''
             }
         except Exception as e:
             logger.error(f"Error extracting price from {price_text}: {str(e)}")
-            return {'amount': 0, 'currency': ''}
+            return default_return
 
-    async def process_listings(self, listings: List[Dict]) -> List[Dict]:
-        """Process listings and fetch their details"""
-        tasks = []
-        for listing in listings:
-            tasks.append(self.fetch_listing_details(listing['link']))
+    async def process_batch(self, session: aiohttp.ClientSession, listings: List[Dict]) -> None:
+        """Process a batch of listings in parallel"""
+        tasks = [self.fetch_details(session, listing['link']) for listing in listings]
+        details_list = await asyncio.gather(*tasks, return_exceptions=True)
         
-        details_list = await asyncio.gather(*tasks)
-        
-        processed_listings = []
+        leads_batch = []
         for listing, details in zip(listings, details_list):
-            listing.update(details)
-            processed_listings.append(listing)
-        
-        return processed_listings
-
-    async def fetch_all_pages(self, max_pages: int = 3) -> List[Dict]:
-        all_listings = []
-        for page in range(1, max_pages + 1):
             try:
-                listings = await self.fetch_page(page)
-                if not listings:
-                    break
-                processed_listings = await self.process_listings(listings)
-                all_listings.extend(processed_listings)
-                logger.info(f"Processed page {page}, found {len(listings)} listings")
-                await asyncio.sleep(2)  # Rate limiting
+                if isinstance(details, dict) and details:
+                    listing.update(details)
+                    leads = self.extract_lead_data(listing)
+                    if leads:
+                        leads_batch.extend(leads)
             except Exception as e:
-                logger.error(f"Error processing page {page}: {str(e)}")
-                
-        return all_listings
+                logger.error(f"Error processing listing {listing.get('id')}: {str(e)}")
+        
+        if leads_batch:
+            try:
+                self.db_manager.save_leads_batch(leads_batch)
+                await asyncio.sleep(0.5)  # Short delay between batches
+            except Exception as e:
+                logger.error(f"Error saving leads batch: {str(e)}")
 
     def extract_lead_data(self, listing_data: Dict) -> List[Dict]:
         leads = []
-        
         for phone in listing_data.get('phones', []):
-            lead_data = {
+            if not phone:
+                continue
+            leads.append({
                 'name': listing_data.get('name', ''),
                 'phone': phone,
                 'website': 'arenda.az',
@@ -178,33 +241,56 @@ class ArendaScraper(BaseScraper):
                     'title': listing_data.get('title', ''),
                     'price': listing_data.get('price', {}),
                     'location': listing_data.get('location', ''),
+                    'address': listing_data.get('address', ''),
                     'details': listing_data.get('details', {}),
                     'features': listing_data.get('features', []),
                     'description': listing_data.get('description', ''),
                     'date': listing_data.get('date', ''),
                     'id': listing_data.get('id', '')
                 }
-            }
-            leads.append(lead_data)
-            
+            })
         return leads
+
+    async def run_async(self):
+        conn = aiohttp.TCPConnector(limit=20, force_close=True)
+        timeout = aiohttp.ClientTimeout(total=60, connect=30, sock_read=30)
+        
+        async with aiohttp.ClientSession(
+            connector=conn,
+            timeout=timeout,
+            headers=self.session.headers,
+            raise_for_status=True
+        ) as session:
+            total_pages = await self.get_page_count(session)
+            
+            # Fetch all pages in parallel
+            tasks = [self.fetch_listings(session, page) for page in range(1, total_pages + 1)]
+            all_pages = await asyncio.gather(*tasks)
+            
+            # Flatten listings
+            all_listings = [item for sublist in all_pages for item in sublist]
+            logger.info(f"Found {len(all_listings)} total listings")
+            
+            # Process in larger batches
+            for i in range(0, len(all_listings), self.batch_size):
+                batch = all_listings[i:i + self.batch_size]
+                try:
+                    await self.process_batch(session, batch)
+                except Exception as e:
+                    logger.error(f"Error processing batch {i//self.batch_size + 1}: {str(e)}")
+                    continue
+                
+            return all_listings
 
     def run(self):
         try:
-            # Get all listings asynchronously
-            listings = asyncio.run(self.fetch_all_pages())
-            logger.info(f"Found {len(listings)} total listings")
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                listings = loop.run_until_complete(self.run_async())
+            finally:
+                loop.close()
             
-            # Process listings and extract leads
-            for listing in listings:
-                try:
-                    leads = self.extract_lead_data(listing)
-                    if leads:
-                        self.db_manager.save_leads_batch(leads)
-                except Exception as e:
-                    logger.error(f"Error processing listing {listing.get('id')}: {str(e)}")
-            
-            # Flush any remaining leads
             self.db_manager.flush_batch()
             
         except Exception as e:
