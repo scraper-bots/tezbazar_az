@@ -1,6 +1,10 @@
 # config.py
+import os
 from dataclasses import dataclass
-from typing import Dict
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 @dataclass
 class SiteConfig:
@@ -10,16 +14,16 @@ class SiteConfig:
 
 # Database configuration
 DB_CONFIG = {
-    "host": "ep-white-cloud-a2453ie4.eu-central-1.aws.neon.tech",
-    "port": 5432,
-    "user": "neondb_owner",
-    "password": "gocazMi82pXl",
-    "database": "neondb"
+    "host": os.getenv("DB_HOST"),
+    "port": int(os.getenv("DB_PORT", 5432)),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
+    "database": os.getenv("DB_NAME")
 }
 
 # Autonet configuration
 AUTONET_CONFIG = SiteConfig(
     name="autonet",
     url="https://autonet.az/api/items/searchItem",
-    table_name="autonet_cars"
+    table_name="autonet_az"
 )
