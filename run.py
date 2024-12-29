@@ -1,6 +1,7 @@
 from scrapers.database import DatabaseManager
 from scrapers.autonet import AutonetScraper
 from scrapers.arenda import ArendaScraper
+from scrapers.birjain import BirjaInScraper
 from dotenv import load_dotenv
 import os
 import logging
@@ -23,7 +24,8 @@ def get_scrapers() -> List[Tuple[Type, str]]:
     """
     return [
         (AutonetScraper, 'https://autonet.az'),
-        (ArendaScraper, 'https://arenda.az')
+        (ArendaScraper, 'https://arenda.az'),
+        (BirjaInScraper, 'https://birja-in.az')
     ]
 
 def run_scraper(scraper_class, base_url: str, db_manager: DatabaseManager) -> float:
