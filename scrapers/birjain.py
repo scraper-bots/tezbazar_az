@@ -190,14 +190,21 @@ class BirjaInScraper(BaseScraper):
                     if name_cell:
                         details['contact']['name'] = name_cell.text.strip()
                     
-                    # Extract phone
+                    # Extract phones
+                    phones = []
                     phone_rows = contact_table.find_all('tr')
                     for row in phone_rows:
                         phone_label = row.find('td', class_='td_name_param_phone')
                         if phone_label and phone_label.find_next_sibling('td'):
-                            phone = phone_label.find_next_sibling('td').text.strip()
-                            details['contact']['phone'] = self.clean_phone_number(phone)
-                            break
+                            phone_text = phone_label.find_next_sibling('td').text.strip()
+                            # Split by common separators
+                            phone_parts = [p.strip() for p in phone_text.replace(',', ' ').replace(';', ' ').split()]
+                            for part in phone_parts:
+                                cleaned_phone = self.clean_phone_number(part)
+                                if cleaned_phone and len(cleaned_phone) >= 9:
+                                    phones.append(cleaned_phone)
+                    
+                    details['contact']['phones'] = phones
 
                 # Log the extracted details
                 logger.debug(f"Extracted contact info: {details['contact']}")
@@ -222,28 +229,30 @@ class BirjaInScraper(BaseScraper):
         """Convert listing and details into lead format"""
         leads = []
         
-        phone = details.get('contact', {}).get('phone')
-        if not phone:
-            logger.debug(f"No phone number found for listing {listing_data.get('id')}")
+        phones = details.get('contact', {}).get('phones', [])
+        if not phones:
+            logger.debug(f"No phone numbers found for listing {listing_data.get('id')}")
             return leads
 
-        lead_data = {
-            'name': details.get('contact', {}).get('name', ''),
-            'phone': phone,
-            'website': 'birja-in.az',
-            'link': listing_data.get('link', ''),
-            'raw_data': {
-                'title': listing_data.get('title', ''),
-                'price': listing_data.get('price', {}),
-                'location': listing_data.get('location', ''),
-                'category': listing_data.get('category', ''),
-                'description': details.get('description', ''),
-                'id': listing_data.get('id', '')
+        # Create a separate lead for each phone number
+        for phone in phones:
+            lead_data = {
+                'name': details.get('contact', {}).get('name', ''),
+                'phone': phone,
+                'website': 'birja-in.az',
+                'link': listing_data.get('link', ''),
+                'raw_data': {
+                    'title': listing_data.get('title', ''),
+                    'price': listing_data.get('price', {}),
+                    'location': listing_data.get('location', ''),
+                    'category': listing_data.get('category', ''),
+                    'description': details.get('description', ''),
+                    'id': listing_data.get('id', '')
+                }
             }
-        }
+            leads.append(lead_data)
+            logger.debug(f"Created lead data for phone {phone}: {lead_data['name']}")
         
-        logger.debug(f"Created lead data: {lead_data}")
-        leads.append(lead_data)
         return leads
 
     async def process_batch(self, session: aiohttp.ClientSession, listings: List[Dict]) -> None:

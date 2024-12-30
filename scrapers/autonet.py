@@ -63,19 +63,28 @@ class AutonetScraper(BaseScraper):
         leads = []
         phones = []
         
+        def format_phone(phone: str) -> str:
+            # Remove all special characters first
+            phone = phone.replace('(', '').replace(')', '').replace(' ', '').replace('-', '')
+            
+            # If already has country code, return as is
+            if phone.startswith('+994'):
+                return phone
+                
+            # If starts with 0, remove it
+            if phone.startswith('0'):
+                phone = phone[1:]
+                
+            # Add country code
+            return f'+994{phone}'
+            
         # Process phone1
         if listing_data.get('phone1'):
-            phone1 = listing_data['phone1'].replace('(', '').replace(')', '').replace(' ', '').replace('-', '')
-            if not phone1.startswith('+'):
-                phone1 = '+994' + phone1
-            phones.append(phone1)
+            phones.append(format_phone(listing_data['phone1']))
         
         # Process phone2 if different
         if listing_data.get('phone2') and listing_data['phone2'] != listing_data.get('phone1'):
-            phone2 = listing_data['phone2'].replace('(', '').replace(')', '').replace(' ', '').replace('-', '')
-            if not phone2.startswith('+'):
-                phone2 = '+994' + phone2
-            phones.append(phone2)
+            phones.append(format_phone(listing_data['phone2']))
         
         base_data = {
             'name': listing_data.get('fullname', ''),
@@ -104,6 +113,8 @@ class AutonetScraper(BaseScraper):
             leads.append(lead_data)
         
         return leads
+
+    
 
     def run(self):
         try:
