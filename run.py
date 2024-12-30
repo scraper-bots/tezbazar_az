@@ -31,9 +31,9 @@ def get_scrapers() -> List[Tuple[Type, str, int]]:
     - Maximum pages to scrape
     """
     return [
-        (AutonetScraper, 'https://autonet.az', 2),  # Scrape 2 pages from autonet
-        (ArendaScraper, 'https://arenda.az', 2),    # Scrape 2 pages from arenda
-        (BirjaInScraper, 'https://birja-in.az', 3)  # Scrape 3 pages from birja-in
+        (AutonetScraper, 'https://autonet.az', 237),  # Scrape 2 pages from autonet
+        (ArendaScraper, 'https://arenda.az', 652),    # Scrape 2 pages from arenda
+        (BirjaInScraper, 'https://birja-in.az', 60)  # Scrape 3 pages from birja-in
     ]
 
 def run_scraper(scraper_class, base_url: str, max_pages: int, db_manager: DatabaseManager) -> float:
