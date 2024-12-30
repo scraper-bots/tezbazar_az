@@ -17,24 +17,33 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-def get_scrapers() -> List[Tuple[Type, str]]:
+def configure_scraper(scraper_instance, max_pages):
+    """Configure scraper with maximum pages if supported"""
+    if hasattr(scraper_instance, 'set_max_pages'):
+        scraper_instance.set_max_pages(max_pages)
+        logger.info(f"Configured {scraper_instance.__class__.__name__} to scrape {max_pages} pages")
+
+def get_scrapers() -> List[Tuple[Type, str, int]]:
     """
-    Returns a list of scraper classes and their base URLs.
-    Add new scrapers here to include them in the main process.
+    Returns a list of tuples containing:
+    - Scraper class
+    - Base URL
+    - Maximum pages to scrape
     """
     return [
-        (AutonetScraper, 'https://autonet.az'),
-        (ArendaScraper, 'https://arenda.az'),
-        (BirjaInScraper, 'https://birja-in.az')
+        (AutonetScraper, 'https://autonet.az', 2),  # Scrape 2 pages from autonet
+        (ArendaScraper, 'https://arenda.az', 2),    # Scrape 2 pages from arenda
+        (BirjaInScraper, 'https://birja-in.az', 3)  # Scrape 3 pages from birja-in
     ]
 
-def run_scraper(scraper_class, base_url: str, db_manager: DatabaseManager) -> float:
+def run_scraper(scraper_class, base_url: str, max_pages: int, db_manager: DatabaseManager) -> float:
     """Run a single scraper and return the execution time"""
     start_time = time.time()
     
     try:
         logger.info(f"Starting {scraper_class.__name__}...")
         scraper = scraper_class(base_url, db_manager)
+        configure_scraper(scraper, max_pages)
         scraper.run()
         
     except Exception as e:
@@ -66,14 +75,13 @@ def main():
         logger.info("Initializing database connection...")
         db_manager = DatabaseManager(db_config)
         
-        # Run each scraper sequentially
-        for scraper_class, base_url in get_scrapers():
+        # Run each scraper sequentially with its configured page limit
+        for scraper_class, base_url, max_pages in get_scrapers():
             try:
-                duration = run_scraper(scraper_class, base_url, db_manager)
+                duration = run_scraper(scraper_class, base_url, max_pages, db_manager)
                 scraper_times[scraper_class.__name__] = duration
             except Exception as e:
                 logger.error(f"Scraper {scraper_class.__name__} failed: {str(e)}")
-                # Continue with next scraper even if one fails
                 continue
         
         # Log summary

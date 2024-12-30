@@ -1,10 +1,12 @@
 import logging
-import time
-from typing import Dict, List
-from bs4 import BeautifulSoup
 import asyncio
 import aiohttp
+from bs4 import BeautifulSoup
+from typing import Dict, List, Set
 from .base import BaseScraper
+import concurrent.futures
+from itertools import chain
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +21,23 @@ class BirjaInScraper(BaseScraper):
             'Connection': 'keep-alive',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
-        self.processed_ids = set()
+        self.processed_ids: Set[str] = set()
+        
+        # Performance tuning parameters
+        self.max_concurrent_requests = 50
+        self.page_batch_size = 5
+        self.listing_batch_size = 25
+        self.max_workers = 4
+        
+        # Connection pooling and timeout settings
+        self.timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_connect=10, sock_read=10)
+        self.conn_limit = 100
+        
+        # Rate limiting
+        self.request_semaphore = asyncio.Semaphore(self.max_concurrent_requests)
+        
+        # Connection pools
+        self.session_pool = []
 
     def get_page_url(self, page: int) -> str:
         """Get URL for specific page"""
@@ -27,56 +45,95 @@ class BirjaInScraper(BaseScraper):
             return f"{self.search_url}/"
         return f"{self.search_url}/page{page}.html"
 
+    async def create_session_pool(self):
+        """Create a pool of aiohttp sessions for concurrent requests"""
+        connector = aiohttp.TCPConnector(limit=self.conn_limit, force_close=True)
+        for _ in range(self.max_workers):
+            session = aiohttp.ClientSession(
+                connector=connector,
+                headers=self.session.headers,
+                timeout=self.timeout
+            )
+            self.session_pool.append(session)
+        return self.session_pool
+
+    async def get_session(self):
+        """Get a session from the pool using round-robin"""
+        if not self.session_pool:
+            await self.create_session_pool()
+        session_idx = int(time.time() * 1000) % len(self.session_pool)
+        return self.session_pool[session_idx]
+
+    async def fetch_with_retry(self, url: str, max_retries: int = 3) -> str:
+        """Fetch URL with retry logic and rate limiting"""
+        async with self.request_semaphore:
+            for attempt in range(max_retries):
+                try:
+                    session = await self.get_session()
+                    async with session.get(url) as response:
+                        if response.status == 200:
+                            return await response.text()
+                        elif response.status == 429:  # Too Many Requests
+                            wait_time = min(2 ** attempt, 8)
+                            await asyncio.sleep(wait_time)
+                        else:
+                            logger.error(f"Error {response.status} fetching {url}")
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        logger.error(f"Failed to fetch {url} after {max_retries} attempts: {e}")
+                    await asyncio.sleep(1)
+            return ""
+
     async def get_page_count(self, session: aiohttp.ClientSession) -> int:
         """Get total number of pages"""
         try:
-            async with session.get(self.search_url) as response:
-                if response.status != 200:
-                    logger.error(f"Failed to fetch page count: {response.status}")
-                    return 1
-
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
-                
-                # Look for total pages in navigation
-                nav_text = soup.select_one('div.navigator_page_all_advert')
-                if nav_text:
-                    text = nav_text.get_text()
-                    try:
-                        pages = int(text.split('Səhifələr:')[1].split()[0])
-                        logger.info(f"Found total pages in nav text: {pages}")
-                        return pages
-                    except (IndexError, ValueError) as e:
-                        logger.error(f"Error parsing nav text: {str(e)}")
-
+            html = await self.fetch_with_retry(self.search_url)
+            if not html:
                 return 1
+
+            soup = BeautifulSoup(html, 'html.parser')
+            nav_text = soup.select_one('div.navigator_page_all_advert')
+            if nav_text:
+                text = nav_text.get_text()
+                try:
+                    pages = int(text.split('Səhifələr:')[1].split()[0])
+                    logger.info(f"Found total pages in nav text: {pages}")
+                    return pages
+                except (IndexError, ValueError) as e:
+                    logger.error(f"Error parsing nav text: {str(e)}")
+
+            return 1
         except Exception as e:
             logger.error(f"Error getting page count: {str(e)}")
             return 1
 
-    async def fetch_page(self, session: aiohttp.ClientSession, page: int) -> List[Dict]:
-        """Fetch listings from a single page"""
-        url = self.get_page_url(page)
-        logger.info(f"Fetching page {page} from URL: {url}")
+    async def fetch_pages_concurrent(self, total_pages: int) -> List[str]:
+        """Fetch multiple pages concurrently in batches"""
+        all_html = []
         
-        try:
-            async with session.get(url) as response:
-                if response.status != 200:
-                    logger.error(f"Failed to fetch page {page}: {response.status}")
-                    return []
-                    
-                html = await response.text()
-                return self.parse_listing_page(html)
-        except Exception as e:
-            logger.error(f"Error fetching page {page}: {str(e)}")
-            return []
+        for batch_start in range(1, total_pages + 1, self.page_batch_size):
+            batch_end = min(batch_start + self.page_batch_size, total_pages + 1)
+            batch_urls = [
+                self.get_page_url(page)
+                for page in range(batch_start, batch_end)
+            ]
+            
+            tasks = [self.fetch_with_retry(url) for url in batch_urls]
+            batch_results = await asyncio.gather(*tasks)
+            all_html.extend(batch_results)
+            
+            await asyncio.sleep(0.1)
+            
+        return all_html
 
     def parse_listing_page(self, html: str) -> List[Dict]:
         """Parse the listings from a page"""
+        if not html:
+            return []
+
         soup = BeautifulSoup(html, 'html.parser')
         listings = []
 
-        # Find all listing blocks
         listing_blocks = soup.select('div.block_one_synopsis_advert_picked, div.block_one_synopsis_advert_fon')
         logger.info(f"Found {len(listing_blocks)} listing blocks")
 
@@ -86,7 +143,6 @@ class BirjaInScraper(BaseScraper):
                 if not listing_div:
                     continue
 
-                # Extract listing data
                 title_elem = listing_div.select_one('h2 a')
                 if not title_elem:
                     continue
@@ -159,59 +215,49 @@ class BirjaInScraper(BaseScraper):
             logger.error(f"Error extracting category: {str(e)}")
         return ''
 
-    async def fetch_listing_details(self, session: aiohttp.ClientSession, url: str) -> Dict:
-        """Fetch detailed listing information"""
+    def parse_html_parallel(self, html_pages: List[str]) -> List[Dict]:
+        """Parse multiple HTML pages in parallel using ThreadPoolExecutor"""
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            parsed_pages = list(executor.map(self.parse_listing_page, html_pages))
+        return list(chain.from_iterable(parsed_pages))
+
+    async def fetch_listing_details(self, url: str) -> Dict:
+        """Fetch and parse listing details"""
+        html = await self.fetch_with_retry(url)
+        if not html:
+            return {}
+            
         try:
-            logger.info(f"Fetching details from {url}")
-            async with session.get(url) as response:
-                if response.status != 200:
-                    logger.error(f"Failed to fetch listing details: {response.status}")
-                    return {}
-                    
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
-                
-                details = {
-                    'description': '',
-                    'contact': {},
-                    'parameters': {}
-                }
+            soup = BeautifulSoup(html, 'html.parser')
+            details = {
+                'description': '',
+                'contact': {'name': '', 'phones': []},
+                'parameters': {}
+            }
 
-                # Extract description
-                desc_td = soup.select_one('td.td_text_advert')
-                if desc_td:
-                    details['description'] = desc_td.text.strip()
+            if desc_td := soup.select_one('td.td_text_advert'):
+                details['description'] = desc_td.text.strip()
 
-                # Extract contact info from contact table
-                contact_table = soup.find('table', class_='contact')
-                if contact_table:
-                    # Extract name
-                    name_cell = contact_table.find('td', class_='name_adder')
-                    if name_cell:
-                        details['contact']['name'] = name_cell.text.strip()
-                    
-                    # Extract phones
-                    phones = []
-                    phone_rows = contact_table.find_all('tr')
-                    for row in phone_rows:
-                        phone_label = row.find('td', class_='td_name_param_phone')
-                        if phone_label and phone_label.find_next_sibling('td'):
-                            phone_text = phone_label.find_next_sibling('td').text.strip()
-                            # Split by common separators
-                            phone_parts = [p.strip() for p in phone_text.replace(',', ' ').replace(';', ' ').split()]
-                            for part in phone_parts:
-                                cleaned_phone = self.clean_phone_number(part)
-                                if cleaned_phone and len(cleaned_phone) >= 9:
-                                    phones.append(cleaned_phone)
-                    
-                    details['contact']['phones'] = phones
+            if contact_table := soup.find('table', class_='contact'):
+                if name_cell := contact_table.find('td', class_='name_adder'):
+                    details['contact']['name'] = name_cell.text.strip()
 
-                # Log the extracted details
-                logger.debug(f"Extracted contact info: {details['contact']}")
-                return details
+                for row in contact_table.find_all('tr'):
+                    if phone_label := row.find('td', class_='td_name_param_phone'):
+                        if phone_cell := phone_label.find_next_sibling('td'):
+                            phone_text = phone_cell.text.strip()
+                            phones = [
+                                self.clean_phone_number(part.strip())
+                                for part in phone_text.replace(',', ' ').replace(';', ' ').split()
+                            ]
+                            details['contact']['phones'].extend(
+                                phone for phone in phones 
+                                if phone and len(phone) >= 9
+                            )
 
+            return details
         except Exception as e:
-            logger.error(f"Error fetching listing details from {url}: {str(e)}")
+            logger.error(f"Error parsing listing details from {url}: {e}")
             return {}
 
     def clean_phone_number(self, phone: str) -> str:
@@ -234,7 +280,6 @@ class BirjaInScraper(BaseScraper):
             logger.debug(f"No phone numbers found for listing {listing_data.get('id')}")
             return leads
 
-        # Create a separate lead for each phone number
         for phone in phones:
             lead_data = {
                 'name': details.get('contact', {}).get('name', ''),
@@ -255,95 +300,62 @@ class BirjaInScraper(BaseScraper):
         
         return leads
 
-    async def process_batch(self, session: aiohttp.ClientSession, listings: List[Dict]) -> None:
-        """Process a batch of listings"""
-        if not listings:
-            return
-
-        tasks = [self.fetch_listing_details(session, listing['link']) for listing in listings]
-        details_list = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        leads_batch = []
-        for listing, details in zip(listings, details_list):
-            try:
-                if isinstance(details, Exception):
-                    logger.error(f"Error fetching details for listing {listing.get('id')}: {str(details)}")
-                    continue
-                    
-                if not isinstance(details, dict):
-                    logger.error(f"Invalid details for listing {listing.get('id')}")
-                    continue
-
-                leads = self.extract_lead_data(listing, details)
-                if leads:
+    async def process_listings_parallel(self, listings: List[Dict]) -> None:
+        """Process listings in parallel batches"""
+        for i in range(0, len(listings), self.listing_batch_size):
+            batch = listings[i:i + self.listing_batch_size]
+            tasks = [self.fetch_listing_details(listing['link']) for listing in batch]
+            details_list = await asyncio.gather(*tasks)
+            
+            leads_batch = []
+            for listing, details in zip(batch, details_list):
+                if details:
+                    leads = self.extract_lead_data(listing, details)
                     leads_batch.extend(leads)
-                    logger.info(f"Added {len(leads)} leads from listing {listing.get('id')}")
-
-            except Exception as e:
-                logger.error(f"Error processing listing {listing.get('id')}: {str(e)}")
-
-        if leads_batch:
-            try:
-                logger.info(f"Saving batch of {len(leads_batch)} leads")
+            
+            if leads_batch:
                 self.db_manager.save_leads_batch(leads_batch)
-                logger.info(f"Successfully saved {len(leads_batch)} leads")
-            except Exception as e:
-                logger.error(f"Error saving leads batch: {str(e)}")
+                await asyncio.sleep(0.1)
 
     async def run_async(self):
-        """Main scraping process"""
-        async with aiohttp.ClientSession(headers=self.session.headers) as session:
+        """Main scraping process with parallel execution"""
+        try:
+            # Get total pages
+            session = await self.get_session()
             total_pages = await self.get_page_count(session)
-            logger.info(f"Found {total_pages} total pages")
+            logger.info(f"Starting scrape of {total_pages} pages")
             
-            all_listings = []
-            page = 1
-            consecutive_empty = 0
+            # Fetch all pages concurrently
+            html_pages = await self.fetch_pages_concurrent(total_pages)
             
-            while page <= total_pages and consecutive_empty < 3:
-                try:
-                    listings = await self.fetch_page(session, page)
-                    
-                    if not listings:
-                        logger.warning(f"No listings found on page {page}")
-                        consecutive_empty += 1
-                    else:
-                        consecutive_empty = 0
-                        all_listings.extend(listings)
-                        
-                        # Process listings in small batches
-                        batch_size = 5
-                        for i in range(0, len(listings), batch_size):
-                            batch = listings[i:i + batch_size]
-                            await self.process_batch(session, batch)
-                            await asyncio.sleep(1)  # Small delay between batches
-                    
-                except Exception as e:
-                    logger.error(f"Error processing page {page}: {str(e)}")
-                    consecutive_empty += 1
-                
-                if consecutive_empty >= 3:
-                    logger.info("Three consecutive empty pages, stopping pagination")
-                    break
-                    
-                page += 1
-                await asyncio.sleep(0.5)  # Small delay between pages
-
-            logger.info(f"Total listings processed: {len(all_listings)}")
+            # Parse listings in parallel
+            all_listings = self.parse_html_parallel(html_pages)
+            logger.info(f"Found {len(all_listings)} total listings")
+            
+            # Process listings in parallel
+            await self.process_listings_parallel(all_listings)
+            
             return all_listings
+            
+        except Exception as e:
+            logger.error(f"Error in main scraping process: {e}")
+            return []
+        finally:
+            # Clean up session pool
+            if self.session_pool:
+                await asyncio.gather(*[session.close() for session in self.session_pool])
 
     def run(self):
-        """Entry point for the scraper"""
+        """Entry point with proper resource cleanup"""
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
                 listings = loop.run_until_complete(self.run_async())
+                self.db_manager.flush_batch()
+                return listings
             finally:
                 loop.close()
-            
-            self.db_manager.flush_batch()
-            
         except Exception as e:
-            logger.error(f"Error in scraping process: {str(e)}")
+            logger.error(f"Error in scraping process: {e}")
             raise

@@ -29,19 +29,32 @@ class ArendaScraper(BaseScraper):
             async with session.get(self.search_url) as response:
                 html = await self.decode_response(await response.read())
                 soup = BeautifulSoup(html, 'html.parser')
-                pagination = soup.select('div.pagination a')
+                
+                # Look for pagination box
+                pagination = soup.select_one('div.pagination_box ul.pagination')
                 if pagination:
-                    page_numbers = [
-                        int(a.text.strip()) 
-                        for a in pagination 
-                        if a.text.strip().isdigit()
-                    ]
-                    return max(page_numbers) if page_numbers else 3
+                    # Find all page number links
+                    page_links = pagination.select('a.page-numbers')
+                    page_numbers = []
+                    
+                    for link in page_links:
+                        try:
+                            num = int(link.text.strip())
+                            page_numbers.append(num)
+                        except ValueError:
+                            continue
+                    
+                    if page_numbers:
+                        return max(page_numbers)
+                
+                # Default to 3 pages if pagination not found
+                logger.warning("Pagination not found, defaulting to 3 pages")
                 return 3
+                
         except Exception as e:
             logger.error(f"Error getting page count: {str(e)}")
             return 3
-
+    
     async def decode_response(self, raw_bytes: bytes) -> str:
         """Decode response with proper encoding handling"""
         encodings = ['utf-8', 'windows-1251', 'utf-8-sig', 'ascii']

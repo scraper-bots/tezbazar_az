@@ -12,6 +12,7 @@ class AutonetScraper(BaseScraper):
     def __init__(self, base_url: str, db_manager):
         super().__init__(base_url, db_manager)
         self.api_url = "https://autonet.az/api/items/searchItem/"
+        self.max_pages = 3  # Default to 3 pages
         self.session.headers.update({
             'Accept': 'application/json',
             'Accept-Encoding': 'gzip, deflate, br',
@@ -24,17 +25,23 @@ class AutonetScraper(BaseScraper):
             'X-Requested-With': 'XMLHttpRequest'
         })
 
+    def set_max_pages(self, pages: int):
+        """Set the maximum number of pages to scrape"""
+        self.max_pages = pages
+        logger.info(f"Set maximum pages to scrape: {pages}")
+
     async def fetch_page(self, page: int) -> List[Dict]:
         params = {'page': page, 'limit': 24}
         
         async with aiohttp.ClientSession(headers=self.session.headers) as session:
             async with session.get(self.api_url, params=params) as response:
                 data = await response.json()
+                logger.info(f"Fetched page {page} with {len(data.get('data', []))} listings")
                 return data.get('data', [])
 
-    async def fetch_all_pages(self, max_pages: int = 3) -> List[Dict]:
+    async def fetch_all_pages(self) -> List[Dict]:
         tasks = []
-        for page in range(1, max_pages + 1):
+        for page in range(1, self.max_pages + 1):
             tasks.append(self.fetch_page(page))
         
         all_listings = []
@@ -111,10 +118,9 @@ class AutonetScraper(BaseScraper):
             lead_data = base_data.copy()
             lead_data['phone'] = phone
             leads.append(lead_data)
+            logger.debug(f"Created lead for {lead_data['name']} with phone {phone}")
         
         return leads
-
-    
 
     def run(self):
         try:
