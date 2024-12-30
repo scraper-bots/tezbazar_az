@@ -21,7 +21,14 @@ class BirjaInScraper(BaseScraper):
             'Connection': 'keep-alive',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
-
+        self.processed_ids: Set[str] = set()
+        
+        # Performance tuning parameters
+        self.max_concurrent_requests = 50
+        self.page_batch_size = 5
+        self.listing_batch_size = 25
+        self.max_workers = 4
+        
         # Connection pooling and timeout settings
         self.timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_connect=10, sock_read=10)
         self.conn_limit = 100
