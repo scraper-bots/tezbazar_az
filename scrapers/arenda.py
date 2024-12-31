@@ -20,7 +20,7 @@ def format_phone(phone):
     # Validate phone number
     if len(digits) != 9:  # Azerbaijan numbers should be 9 digits
         return None
-    if not digits.startswith(('50', '51', '55', '70', '77')):  # Valid Azerbaijan prefixes
+    if not digits.startswith(('10','12', '50', '51', '55','60', '70', '77','99')):  
         return None
         
     return digits
