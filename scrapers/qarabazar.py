@@ -282,8 +282,11 @@ def get_listing_links(soup: BeautifulSoup, base_url: str) -> List[str]:
     
     return list(links)
 
-def save_to_db(conn, items: List[Dict], stats: ScraperStats) -> None:
+def save_to_db(conn: psycopg2.extensions.connection, items: List[Dict], stats: Optional[ScraperStats] = None) -> None:
     """Save scraped items to database"""
+    if stats is None:
+        stats = ScraperStats()
+        
     cursor = None
     try:
         cursor = conn.cursor()
