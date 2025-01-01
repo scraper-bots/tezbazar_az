@@ -6,7 +6,7 @@ import json
 import time
 import random
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 import psycopg2
 import os
 from dotenv import load_dotenv
@@ -29,17 +29,51 @@ class ScraperStats:
     def __post_init__(self):
         self.invalid_phone_list = []
 
+    def print_summary(self):
+        """Print summary of scraping statistics"""
+        print("\nScraping Statistics:")
+        print(f"Total pages processed: {self.total_pages}")
+        print(f"Total listings found: {self.total_listings}")
+        print(f"Valid numbers found: {self.valid_numbers}")
+        print(f"Invalid numbers found: {self.invalid_numbers}")
+        print(f"New records inserted: {self.db_inserts}")
+        print(f"Records updated: {self.db_updates}")
+        if self.invalid_numbers > 0:
+            print("\nInvalid phone numbers:")
+            for phone in self.invalid_phone_list:
+                print(f"  {phone}")
+
 def get_db_connection():
     """Create database connection"""
-    return psycopg2.connect(
-        dbname=os.getenv('DB_NAME'),
-        user=os.getenv('DB_USER'),
-        password=os.getenv('DB_PASSWORD'),
-        host=os.getenv('DB_HOST'),
-        port=os.getenv('DB_PORT')
-    )
+    try:
+        return psycopg2.connect(
+            dbname=os.getenv('DB_NAME'),
+            user=os.getenv('DB_USER'),
+            password=os.getenv('DB_PASSWORD'),
+            host=os.getenv('DB_HOST'),
+            port=os.getenv('DB_PORT')
+        )
+    except psycopg2.Error as e:
+        print(f"Database connection error: {e}")
+        raise
 
-def format_phone(phone: str, stats: ScraperStats, original: str = None) -> Optional[str]:
+def extract_numbers_from_text(text: str) -> Set[str]:
+    """Extract potential phone numbers from text using regex patterns"""
+    # Common Azerbaijani phone number patterns
+    patterns = [
+        r'\+994\s*\d{2}\s*\d{3}\s*\d{2}\s*\d{2}',  # +994 XX XXX XX XX
+        r'0\s*\d{2}\s*\d{3}\s*\d{2}\s*\d{2}',      # 0XX XXX XX XX
+        r'\d{2}\s*\d{3}\s*\d{2}\s*\d{2}',          # XX XXX XX XX
+    ]
+    
+    numbers = set()
+    for pattern in patterns:
+        matches = re.finditer(pattern, text, re.MULTILINE)
+        numbers.update(match.group() for match in matches)
+    
+    return numbers
+
+def format_phone(phone: str, stats: Optional[ScraperStats] = None, original: str = None) -> Optional[str]:
     """Format and validate phone number according to rules"""
     if not phone:
         return None
@@ -66,8 +100,8 @@ def format_phone(phone: str, stats: ScraperStats, original: str = None) -> Optio
             stats.invalid_phone_list.append(f"Prefix error - Original: {original}, Cleaned: {digits}")
         return None
     
-    # Validate fourth digit (should be 2-9)
-    if digits[3] in ('0', '1'):
+    # Check the fourth digit for 0 or 1
+    if digits[3] in ('0', '1'):  # Changed back to digits[3]
         if stats:
             stats.invalid_phone_list.append(f"Fourth digit error - Original: {original}, Cleaned: {digits}")
         return None
@@ -78,7 +112,8 @@ def get_headers() -> Dict[str, str]:
     """Get randomized headers"""
     user_agents = [
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     ]
     
     return {
@@ -98,10 +133,16 @@ def make_request(session: requests.Session, url: str, max_retries: int = 3) -> O
             
             if response.status_code == 200:
                 return BeautifulSoup(response.text, 'html.parser')
+            elif response.status_code == 404:
+                print(f"Page not found: {url}")
+                return None
+            elif response.status_code == 403:
+                print(f"Access forbidden: {url}")
+                time.sleep(random.uniform(5, 10))  # Longer delay for forbidden access
+            else:
+                print(f"Got status code {response.status_code} for {url}")
             
-            print(f"Got status code {response.status_code} for {url}")
-            
-        except Exception as e:
+        except requests.RequestException as e:
             print(f"Request error (attempt {attempt + 1}/{max_retries}): {str(e)}")
             if attempt == max_retries - 1:
                 raise
@@ -109,124 +150,191 @@ def make_request(session: requests.Session, url: str, max_retries: int = 3) -> O
     
     return None
 
-def extract_listing_details(soup: BeautifulSoup, url: str) -> Optional[Dict]:
+def extract_phone_numbers(soup: BeautifulSoup) -> Set[str]:
+    """Extract all possible phone numbers from the page"""
+    phone_numbers = set()
+    
+    # Check for numbers in elements with itemprop="telephone"
+    for elem in soup.find_all(['span', 'div', 'p', 'a'], {'itemprop': 'telephone'}):
+        if elem.text:
+            phone_numbers.add(''.join(elem.text.split()))
+    
+    # Check elements with common phone-related classes
+    phone_classes = ['phone', 'phones', 'tel', 'telephone', 'contact']
+    for class_name in phone_classes:
+        for elem in soup.find_all(class_=lambda x: x and class_name in x.lower()):
+            if elem.text:
+                phone_numbers.add(''.join(elem.text.split()))
+    
+    # Look for phone patterns in href="tel:" attributes
+    for elem in soup.find_all('a', href=re.compile(r'^tel:')):
+        phone = elem['href'].replace('tel:', '')
+        if phone:
+            phone_numbers.add(''.join(phone.split()))
+    
+    # Check for numbers in the entire page text
+    text_numbers = extract_numbers_from_text(soup.get_text())
+    phone_numbers.update(text_numbers)
+    
+    return phone_numbers
+
+def extract_listing_details(soup: BeautifulSoup, url: str, stats: ScraperStats) -> Optional[Dict]:
     """Extract details from a listing page"""
     try:
         details = {}
-        
-        # Extract title
-        title = soup.find('h1', class_='title')
-        if title:
-            details['title'] = title.text.strip()
-        
-        # Extract price
-        price_elem = soup.find('div', class_='price')
-        if price_elem:
-            details['price'] = price_elem.text.strip()
-            
-        # Extract description
-        desc_elem = soup.find('div', class_='description')
-        if desc_elem:
-            details['description'] = desc_elem.text.strip()
+
+        # Extract title - try multiple possible elements
+        for title_elem in soup.find_all(['h1', 'h2', 'h3', 'a'], class_=['title', 'title_synopsis_adv']):
+            if title_elem.text.strip():
+                details['title'] = title_elem.text.strip()
+                break
+
+        # Extract price - try multiple possible elements
+        for price_elem in soup.find_all(['span', 'div'], class_=['price', 'value_cost_adv']):
+            if price_elem.text.strip():
+                details['price'] = price_elem.text.strip()
+                break
+
+        # Extract description - try multiple possible elements
+        for desc_elem in soup.find_all(['div', 'p'], class_=['description', 'short-text-ads', 'details']):
+            if desc_elem.text.strip():
+                details['description'] = desc_elem.text.strip()
+                break
 
         # Extract contact info
-        contact_info = {}
-        contact_elem = soup.find('div', class_='contact-info')
-        if contact_elem:
-            # Extract name
-            name_elem = contact_elem.find('div', class_='name')
+        contact_info = {'name': None}
+        
+        # Try to find seller name using schema.org markup
+        seller_elem = soup.find(['div', 'span'], {'itemprop': 'seller'})
+        if seller_elem:
+            name_elem = seller_elem.find(['span', 'div'], {'itemprop': 'name'})
             if name_elem:
                 contact_info['name'] = name_elem.text.strip()
-                
-            # Extract phone numbers
-            phone_elem = contact_elem.find('div', class_='phone')
-            phone = None
-            if phone_elem:
-                phone = phone_elem.text.strip()
+        
+        # If not found, try traditional class-based selectors
+        if not contact_info['name']:
+            contact_elem = soup.find(['div', 'section'], class_=['contact-info', 'seller-info'])
+            if contact_elem:
+                for name_elem in contact_elem.find_all(['div', 'span', 'p'], class_='name'):
+                    if name_elem.text.strip():
+                        contact_info['name'] = name_elem.text.strip()
+                        break
+        
+        # Extract all possible phone numbers
+        phone_numbers = extract_phone_numbers(soup)
+        valid_phones = set()
+        
+        # Format and validate each phone number
+        for phone in phone_numbers:
+            formatted_phone = format_phone(phone, stats, phone)
+            if formatted_phone:
+                valid_phones.add(formatted_phone)
+                stats.valid_numbers += 1
+            else:
+                stats.invalid_numbers += 1
 
-        # Format phone number
-        formatted_phone = None
-        if phone:
-            formatted_phone = format_phone(phone, None, phone)
-            
-        if not formatted_phone:
+        if not valid_phones:
             return None
 
-        # Create item structure
-        return {
-            'name': contact_info.get('name'),
-            'phone': formatted_phone,
+        # Create base item structure
+        base_item = {
+            'name': contact_info['name'],
             'website': 'qarabazar.az',
             'link': url,
             'raw_data': {
                 'title': details.get('title'),
                 'price': details.get('price'),
-                'description': details.get('description')
+                'description': details.get('description'),
+                'all_phones': list(valid_phones)
             }
         }
+
+        # Use first valid phone as primary
+        base_item['phone'] = list(valid_phones)[0]
+        
+        return base_item
             
     except Exception as e:
-        print(f"Error extracting listing details: {e}")
+        print(f"Error extracting listing details from {url}: {e}")
         return None
 
 def get_listing_links(soup: BeautifulSoup, base_url: str) -> List[str]:
     """Extract all listing links from a page"""
-    links = []
-    listings = soup.find_all('div', class_='listing-item')
+    links = set()
     
-    for listing in listings:
-        link_elem = listing.find('a')
-        if link_elem and link_elem.get('href'):
-            link = urljoin(base_url, link_elem['href'])
-            links.append(link)
+    # Find listings using multiple possible class names
+    listing_classes = ['block_one_synopsis_advert', 'listing-item', 'item']
+    for class_name in listing_classes:
+        listings = soup.find_all(['div', 'article'], class_=class_name)
+        for listing in listings:
+            # Try to find link in multiple ways
+            link_elem = None
+            for elem in listing.find_all('a'):
+                href = elem.get('href')
+                if href and not href.startswith('#'):
+                    link_elem = elem
+                    break
+                    
+            if link_elem and link_elem.get('href'):
+                link = urljoin(base_url, link_elem['href'])
+                links.add(link)
+                print(f"Found listing link: {link}")
     
-    return links
+    return list(links)
 
 def save_to_db(conn, items: List[Dict], stats: ScraperStats) -> None:
     """Save scraped items to database"""
-    cursor = conn.cursor()
-    
-    for item in items:
-        try:
-            query = """
-                INSERT INTO leads (name, phone, website, link, scraped_at, raw_data)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (phone) DO UPDATE
-                SET name = EXCLUDED.name,
-                    website = EXCLUDED.website,
-                    link = EXCLUDED.link,
-                    scraped_at = EXCLUDED.scraped_at,
-                    raw_data = EXCLUDED.raw_data
-                RETURNING (xmax = 0) AS inserted;
-            """
-            
-            values = (
-                item['name'],
-                item['phone'],
-                item['website'],
-                item['link'],
-                datetime.now(),
-                json.dumps(item['raw_data'], ensure_ascii=False)
-            )
-            
-            cursor.execute(query, values)
-            is_insert = cursor.fetchone()[0]
-            
-            if is_insert:
-                stats.db_inserts += 1
-                print(f"New number inserted: {item['phone']}")
-            else:
-                stats.db_updates += 1
-                print(f"Number updated: {item['phone']}")
+    cursor = None
+    try:
+        cursor = conn.cursor()
+        
+        for item in items:
+            try:
+                query = """
+                    INSERT INTO leads (name, phone, website, link, scraped_at, raw_data)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (phone) DO UPDATE
+                    SET name = EXCLUDED.name,
+                        website = EXCLUDED.website,
+                        link = EXCLUDED.link,
+                        scraped_at = EXCLUDED.scraped_at,
+                        raw_data = EXCLUDED.raw_data
+                    RETURNING (xmax = 0) AS inserted;
+                """
                 
-            conn.commit()
-            
-        except Exception as e:
-            print(f"Error saving item to database: {e}")
-            conn.rollback()
-            continue
-            
-    cursor.close()
+                values = (
+                    item['name'],
+                    item['phone'],
+                    item['website'],
+                    item['link'],
+                    datetime.now(),
+                    json.dumps(item['raw_data'], ensure_ascii=False)
+                )
+                
+                cursor.execute(query, values)
+                is_insert = cursor.fetchone()[0]
+                
+                if is_insert:
+                    stats.db_inserts += 1
+                    print(f"New number inserted: {item['phone']}")
+                else:
+                    stats.db_updates += 1
+                    print(f"Number updated: {item['phone']}")
+                    
+                conn.commit()
+                
+            except Exception as e:
+                print(f"Error saving item to database: {e}")
+                conn.rollback()
+                continue
+                
+    except Exception as e:
+        print(f"Database error: {e}")
+        raise
+        
+    finally:
+        if cursor:
+            cursor.close()
 
 def scrape() -> List[Dict]:
     """Main scraping function"""
@@ -265,10 +373,9 @@ def scrape() -> List[Dict]:
                             print(f"Failed to get listing details for {link}")
                             continue
                         
-                        details = extract_listing_details(listing_soup, link)
+                        details = extract_listing_details(listing_soup, link, stats)
                         if details:
                             items_to_process.append(details)
-                            stats.valid_numbers += 1
                             print(f"Successfully processed listing with phone {details['phone']}")
                         else:
                             stats.invalid_numbers += 1
@@ -290,22 +397,14 @@ def scrape() -> List[Dict]:
             try:
                 save_to_db(conn, items_to_process, stats)
             finally:
-                conn.close()
+                if conn:
+                    conn.close()
         
         # Print final statistics
-        print("\nScraping Statistics:")
-        print(f"Total pages processed: {stats.total_pages}")
-        print(f"Total listings found: {stats.total_listings}")
-        print(f"Valid numbers: {stats.valid_numbers}")
-        print(f"Invalid numbers: {stats.invalid_numbers}")
-        print(f"New records inserted: {stats.db_inserts}")
-        print(f"Records updated: {stats.db_updates}")
-        if stats.invalid_numbers > 0:
-            print("\nInvalid phone numbers:")
-            for phone in stats.invalid_phone_list:
-                print(f"  {phone}")
+        stats.print_summary()
         
     except Exception as e:
         print(f"Scraping error: {e}")
+        raise
     
     return items_to_process
