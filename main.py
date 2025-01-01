@@ -7,7 +7,8 @@ from datetime import datetime
 from dotenv import load_dotenv
 import psycopg2
 from concurrent.futures import ThreadPoolExecutor
-from scrapers import arenda, autonet, birja, birjain
+# from scrapers import arenda, autonet, birja, birjain, boss
+from scrapers import boss
 
 # Configure logging
 logging.basicConfig(
@@ -83,10 +84,11 @@ async def main():
     """Main function to run all scrapers concurrently"""
     # List of all scraper modules
     scrapers = [
-        arenda,
-        autonet,
-        birja,
-        birjain  # Added both birja scrapers
+        # arenda,
+        # autonet,
+        # birja,
+        # birjain, 
+        boss,
     ]
     
     conn = None
