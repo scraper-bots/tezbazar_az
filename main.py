@@ -7,7 +7,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 import psycopg2
 from concurrent.futures import ThreadPoolExecutor
-from scrapers import arenda, autonet
+from scrapers import arenda, autonet, birja, birjain
 
 # Configure logging
 logging.basicConfig(
@@ -85,7 +85,8 @@ async def main():
     scrapers = [
         arenda,
         autonet,
-        # Add other scrapers here
+        birja,
+        birjain  # Added both birja scrapers
     ]
     
     conn = None
