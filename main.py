@@ -7,8 +7,8 @@ from datetime import datetime
 from dotenv import load_dotenv
 import psycopg2
 from concurrent.futures import ThreadPoolExecutor
-# from scrapers import arenda, autonet, birja, birjain, boss, emlak
-from scrapers import emlak
+# from scrapers import arenda, autonet, birja, birjain, boss, emlak, ipoteka
+from scrapers import ipoteka
 
 # Configure logging
 logging.basicConfig(
@@ -52,20 +52,28 @@ async def run_scraper(scraper_module, db_connection):
     
     logger.info(f"Starting {scraper_name} scraper")
     
-    # Run the scraper in a thread pool since most scrapers are synchronous
     with ThreadPoolExecutor() as pool:
         try:
-            # Run the scraper
             start_time = datetime.now()
-            data = await loop.run_in_executor(pool, scraper_module.scrape)
+            
+            # Handle both returned data and stats
+            result = await loop.run_in_executor(pool, scraper_module.scrape)
+            if isinstance(result, tuple):
+                data, stats = result
+            else:
+                data = result
+                stats = None  # For backwards compatibility with other scrapers
             
             duration = (datetime.now() - start_time).total_seconds()
             logger.info(f"Completed scraping with {scraper_name}, found {len(data) if data else 0} items in {duration:.2f} seconds")
             
-            # Save to database if we have data and the module has a save_to_db function
             if data and hasattr(scraper_module, 'save_to_db'):
                 try:
-                    await loop.run_in_executor(pool, scraper_module.save_to_db, db_connection, data)
+                    # Pass stats if available
+                    if stats:
+                        await loop.run_in_executor(pool, scraper_module.save_to_db, db_connection, data, stats)
+                    else:
+                        await loop.run_in_executor(pool, scraper_module.save_to_db, db_connection, data)
                     logger.info(f"Saved data from {scraper_name} to database")
                 except Exception as e:
                     logger.error(f"Database error in {scraper_name}: {e}")
@@ -79,7 +87,7 @@ async def run_scraper(scraper_module, db_connection):
             
         finally:
             logger.info(f"Finished processing {scraper_name}")
-
+            
 async def main():
     """Main function to run all scrapers concurrently"""
     # List of all scraper modules
@@ -89,7 +97,8 @@ async def main():
         # birja,
         # birjain, 
         # boss,
-        emlak
+        # emlak,
+        ipoteka
     ]
     
     conn = None
