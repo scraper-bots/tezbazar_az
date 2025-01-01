@@ -30,8 +30,8 @@ A comprehensive web scraping system for collecting contact information from vari
 
 1. Clone the repository:
 ```bash
-git clone <repository-url>
-cd <project-directory>
+git clone https://github.com/Ismat-Samadov/numera.git
+cd numera
 ```
 
 2. Create and activate a virtual environment:
