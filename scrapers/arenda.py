@@ -317,20 +317,14 @@ def scrape():
     db_inserter = None
     
     try:
-        first_page_url = f"{base_url}/{search_params}"
-        response = make_request(session, first_page_url)
-        if not response:
-            print("Failed to get first page")
-            return []
-        
-        soup = BeautifulSoup(response.text, 'html.parser')
-        total_pages = get_total_pages(soup)
-        print(f"Found {total_pages} pages to scrape")
+        # Manually defined pages
+        pages_to_scrape = [1, 2, 3]
+        print(f"Scraping pages: {pages_to_scrape}")
         
         urls = []
-        for page in range(1, total_pages + 1):
+        for page in pages_to_scrape:
             if page == 1:
-                urls.append(first_page_url)
+                urls.append(f"{base_url}/{search_params}")
             else:
                 urls.append(f"{base_url}/{page}/{search_params}")
         
@@ -356,7 +350,7 @@ def scrape():
             total_stats.db_updates += page_stats.db_updates
             
         print("\nFinal Statistics:")
-        print(f"Total pages processed: {len(db_inserter.stats)}/{total_pages}")
+        print(f"Total pages processed: {len(db_inserter.stats)}/{len(pages_to_scrape)}")
         print(f"Total links found: {total_stats.total_links}")
         print(f"Total numbers found: {total_stats.total_numbers}")
         print(f"Valid numbers: {total_stats.valid_numbers}")
