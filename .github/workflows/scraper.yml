@@ -2,7 +2,9 @@ name: Daily Web Scraping
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # Runs at 00:00 UTC every day
+    # - cron: '0 0 * * *'  # Runs at 00:00 UTC every day
+    - cron: '*/5 * * * *'  # Runs every 5 minutes
+
   workflow_dispatch:  # Allows manual triggering
 
 jobs:
@@ -17,17 +19,47 @@ jobs:
       DB_PORT: ${{ secrets.DB_PORT }}
 
     steps:
-    - uses: actions/checkout@v2
-    
+    - name: Checkout repository
+      uses: actions/checkout@v3  # Updated to v3
+      
     - name: Set up Python
-      uses: actions/setup-python@v2
+      uses: actions/setup-python@v4  # Updated to v4
       with:
-        python-version: '3.x'
+        python-version: '3.12'  # Specify exact version
+        cache: 'pip'  # Enable pip caching
     
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
     
+    - name: Verify database connection
+      run: |
+        python -c "
+        import psycopg2
+        import os
+        try:
+            conn = psycopg2.connect(
+                dbname=os.getenv('DB_NAME'),
+                user=os.getenv('DB_USER'),
+                password=os.getenv('DB_PASSWORD'),
+                host=os.getenv('DB_HOST'),
+                port=os.getenv('DB_PORT')
+            )
+            print('Database connection successful')
+            conn.close()
+        except Exception as e:
+            print(f'Database connection failed: {e}')
+            exit(1)
+        "
+    
     - name: Run scraper
       run: python main.py
+      continue-on-error: true  # Continue even if some scrapers fail
+      
+    - name: Check for script errors
+      if: failure()
+      run: |
+        echo "Checking logs for errors..."
+        cat scraper_*.log || true
+        exit 1
