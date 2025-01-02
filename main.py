@@ -1,4 +1,3 @@
-# main.py
 import asyncio
 import os
 import sys
@@ -7,8 +6,9 @@ from datetime import datetime
 from dotenv import load_dotenv
 import psycopg2
 from concurrent.futures import ThreadPoolExecutor
-from scrapers import arenda, autonet, birja, birjain, boss, emlak, ipoteka, qarabazar
-# from scrapers import qarabazar
+from typing import Optional, Dict, List, Any
+from scrapers import arenda, autonet, birja, birjain, boss, emlak, ipoteka, qarabazar, ucuztap
+# from scrapers import ucuztap  # Import other scrapers as needed
 
 # Configure logging
 logging.basicConfig(
@@ -24,28 +24,44 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 
-def get_db_connection():
-    """Create and return database connection using environment variables"""
-    required_env_vars = ['DB_NAME', 'DB_USER', 'DB_PASSWORD', 'DB_HOST', 'DB_PORT']
-    
-    # Check for required environment variables
-    missing_vars = [var for var in required_env_vars if not os.getenv(var)]
-    if missing_vars:
-        raise EnvironmentError(f"Missing required environment variables: {', '.join(missing_vars)}")
-    
-    try:
-        return psycopg2.connect(
-            dbname=os.getenv('DB_NAME'),
-            user=os.getenv('DB_USER'),
-            password=os.getenv('DB_PASSWORD'),
-            host=os.getenv('DB_HOST'),
-            port=os.getenv('DB_PORT')
-        )
-    except psycopg2.Error as e:
-        logger.error(f"Database connection error: {e}")
-        raise
+class DatabaseManager:
+    """Database connection manager with context support"""
+    def __init__(self):
+        self.conn = None
+        self.required_env_vars = ['DB_NAME', 'DB_USER', 'DB_PASSWORD', 'DB_HOST', 'DB_PORT']
 
-async def run_scraper(scraper_module, db_connection):
+    def __enter__(self):
+        self.conn = self.get_connection()
+        return self.conn
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.conn:
+            try:
+                self.conn.close()
+                logger.info("Database connection closed")
+            except Exception as e:
+                logger.error(f"Error closing database connection: {e}")
+
+    def get_connection(self) -> psycopg2.extensions.connection:
+        """Create and return database connection"""
+        # Check for required environment variables
+        missing_vars = [var for var in self.required_env_vars if not os.getenv(var)]
+        if missing_vars:
+            raise EnvironmentError(f"Missing required environment variables: {', '.join(missing_vars)}")
+        
+        try:
+            return psycopg2.connect(
+                dbname=os.getenv('DB_NAME'),
+                user=os.getenv('DB_USER'),
+                password=os.getenv('DB_PASSWORD'),
+                host=os.getenv('DB_HOST'),
+                port=os.getenv('DB_PORT')
+            )
+        except psycopg2.Error as e:
+            logger.error(f"Database connection error: {e}")
+            raise
+
+async def run_scraper(scraper_module) -> None:
     """Run a scraper in a thread pool and save results to database"""
     loop = asyncio.get_event_loop()
     scraper_name = scraper_module.__name__.split('.')[-1]
@@ -56,41 +72,32 @@ async def run_scraper(scraper_module, db_connection):
         try:
             start_time = datetime.now()
             
-            # Handle both returned data and stats
-            result = await loop.run_in_executor(pool, scraper_module.scrape)
-            if isinstance(result, tuple):
-                data, stats = result
-            else:
-                data = result
-                stats = None  # For backwards compatibility with other scrapers
+            # Run the scraper
+            data = await loop.run_in_executor(pool, scraper_module.scrape)
             
             duration = (datetime.now() - start_time).total_seconds()
             logger.info(f"Completed scraping with {scraper_name}, found {len(data) if data else 0} items in {duration:.2f} seconds")
             
-            if data and hasattr(scraper_module, 'save_to_db'):
+            # Save data if we have any
+            if data:
                 try:
-                    # Pass stats if available
-                    if stats:
-                        await loop.run_in_executor(pool, scraper_module.save_to_db, db_connection, data, stats)
-                    else:
-                        await loop.run_in_executor(pool, scraper_module.save_to_db, db_connection, data)
-                    logger.info(f"Saved data from {scraper_name} to database")
+                    # Let the scraper manage its own database connection
+                    if hasattr(scraper_module, 'save_to_db'):
+                        await loop.run_in_executor(pool, lambda: scraper_module.save_to_db(data))
+                        logger.info(f"Saved data from {scraper_name} to database")
                 except Exception as e:
                     logger.error(f"Database error in {scraper_name}: {e}")
-            elif not data:
+            else:
                 logger.warning(f"No data returned from {scraper_name}")
-            elif not hasattr(scraper_module, 'save_to_db'):
-                logger.warning(f"No save_to_db function found in {scraper_name}")
-            
+                
         except Exception as e:
             logger.error(f"Error in {scraper_name}: {e}", exc_info=True)
             
         finally:
             logger.info(f"Finished processing {scraper_name}")
-            
-async def main():
+
+async def main() -> None:
     """Main function to run all scrapers concurrently"""
-    # List of all scraper modules
     scrapers = [
         arenda,
         autonet,
@@ -99,17 +106,13 @@ async def main():
         boss,
         emlak,
         ipoteka,
-        qarabazar
+        qarabazar,
+        ucuztap
     ]
     
-    conn = None
     try:
-        # Create database connection
-        conn = get_db_connection()
-        logger.info("Successfully connected to database")
-        
         # Create tasks for all scrapers
-        tasks = [run_scraper(scraper, conn) for scraper in scrapers]
+        tasks = [run_scraper(scraper) for scraper in scrapers]
         
         # Run all scrapers concurrently
         start_time = datetime.now()
@@ -121,17 +124,9 @@ async def main():
     except Exception as e:
         logger.error(f"Error in main: {e}", exc_info=True)
         raise
-    
-    finally:
-        # Close database connection
-        if conn:
-            try:
-                conn.close()
-                logger.info("Database connection closed")
-            except Exception as e:
-                logger.error(f"Error closing database connection: {e}")
 
-if __name__ == "__main__":
+def run():
+    """Entry point function with error handling"""
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
@@ -139,3 +134,6 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)
+
+if __name__ == "__main__":
+    run()
