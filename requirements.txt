@@ -22,6 +22,7 @@ pytz==2024.2
 requests==2.32.3
 six==1.17.0
 soupsieve==2.6
+tqdm==4.67.1
 tzdata==2024.2
 urllib3==2.3.0
 yarl==1.18.3
