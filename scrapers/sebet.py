@@ -1,12 +1,11 @@
-# scrapers/emlak.py
-import requests 
+import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 import json
 import time
 import random
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 from dataclasses import dataclass
 from urllib.parse import urljoin
 
@@ -16,7 +15,6 @@ class ScraperStats:
     total_listings: int = 0
     valid_numbers: int = 0
     invalid_numbers: int = 0
-    multi_phone_items: int = 0
     invalid_phone_list: List[str] = None
 
     def __post_init__(self):
@@ -29,7 +27,6 @@ class ScraperStats:
         print(f"Total listings found: {self.total_listings}")
         print(f"Valid numbers found: {self.valid_numbers}")
         print(f"Invalid numbers found: {self.invalid_numbers}")
-        print(f"Listings with multiple phones: {self.multi_phone_items}")
         if self.invalid_numbers > 0:
             print("\nInvalid phone numbers:")
             for phone in self.invalid_phone_list:
@@ -79,16 +76,17 @@ def get_headers() -> Dict[str, str]:
     
     return {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Language': 'az,en-US;q=0.7,en;q=0.3',
         'Connection': 'keep-alive',
-        'User-Agent': random.choice(user_agents)
+        'User-Agent': random.choice(user_agents),
+        'Referer': 'https://sebet.az'
     }
 
 def make_request(session: requests.Session, url: str, max_retries: int = 3) -> Optional[BeautifulSoup]:
     """Make HTTP request with retries and random delays"""
     for attempt in range(max_retries):
         try:
-            time.sleep(random.uniform(1, 2))  # Random delay between requests
+            time.sleep(random.uniform(1, 2))
             response = session.get(url, headers=get_headers(), timeout=10)
             
             if response.status_code == 200:
@@ -97,128 +95,84 @@ def make_request(session: requests.Session, url: str, max_retries: int = 3) -> O
             print(f"Got status code {response.status_code} for {url}")
             
         except Exception as e:
-            print(f"Request error (attempt {attempt + 1}/{max_retries}): {str(e)}")
+            print(f"Request error (attempt {attempt + 1}/{max_retries}): {e}")
             if attempt == max_retries - 1:
                 raise
-            time.sleep(random.uniform(2, 4))  # Longer delay after error
+            time.sleep(random.uniform(2, 4))
     
     return None
 
-def extract_phones(text: str) -> List[str]:
-    """Extract phone numbers from text"""
-    if not text:
-        return []
-        
-    # Remove any extra whitespace
-    text = text.strip()
-    
-    # Split by comma
-    phones = [p.strip() for p in text.split(',')]
-    
-    # Clean each phone number
-    cleaned_phones = []
-    for phone in phones:
-        # Remove parentheses and extra spaces
-        cleaned = re.sub(r'[()]', '', phone).strip()
-        if cleaned:
-            cleaned_phones.append(cleaned)
-            
-    return cleaned_phones
+def extract_phone_from_link(href: str) -> Optional[str]:
+    """Extract phone number from tel: link"""
+    if not href:
+        return None
+    phone_match = re.search(r'tel:\s*(\d+)', href)
+    return phone_match.group(1) if phone_match else None
 
-def extract_listing_details(soup: BeautifulSoup, url: str) -> Optional[Dict]:
+def extract_listing_details(soup: BeautifulSoup, url: str, stats: ScraperStats) -> Optional[Dict]:
     """Extract details from a listing page"""
     try:
-        details = {}
-        
-        # Extract price
-        price_elem = soup.find('div', class_='price')
-        if price_elem:
-            price_text = price_elem.find('span', class_='m')
-            if price_text:
-                details['price'] = price_text.text.strip()
-
-        # Extract title and description
-        title = soup.find('h1', class_='title')
-        if title:
-            details['title'] = title.text.strip()
+        # Extract phone number from tel: link
+        phone_elem = soup.find('a', href=lambda x: x and x.startswith('tel:'))
+        if not phone_elem:
+            return None
             
-        desc_elem = soup.find('div', class_='desc')
-        if desc_elem:
-            details['description'] = desc_elem.text.strip()
-
-        # Extract technical characteristics
-        tech_chars = {}
-        tech_list = soup.find('dl', class_='technical-characteristics')
-        if tech_list:
-            for item in tech_list.find_all('dd'):
-                label = item.find('span', class_='label')
-                if label:
-                    key = label.text.strip()
-                    value = item.text.replace(key, '').strip()
-                    tech_chars[key] = value
-
-        # Extract contact info
-        contact_info = {}
-        seller_data = soup.find('div', class_='seller-data')
-        if seller_data:
-            silver_box = seller_data.find('div', class_='silver-box')
-            if silver_box:
-                name_elem = silver_box.find('p', class_='name-seller')
-                if name_elem:
-                    name_text = name_elem.find(text=True)
-                    if name_text:
-                        contact_info['name'] = name_text.strip()
-
-                phone_elem = silver_box.find('p', {'class': 'phone'})
-                phone_numbers = []
-                if phone_elem:
-                    phone_text = phone_elem.get_text(strip=True)
-                    if phone_text:
-                        print(f"Found phone text: {phone_text}")
-                        phone_numbers = extract_phones(phone_text)
-
-        if not phone_numbers:
+        raw_phone = extract_phone_from_link(phone_elem['href'])
+        if not raw_phone:
+            return None
+            
+        formatted_phone = format_phone(raw_phone, stats, raw_phone)
+        if not formatted_phone:
             return None
 
-        # Format each phone number
-        valid_phones = []
-        for phone in phone_numbers:
-            formatted = format_phone(phone, None, phone)
-            if formatted:
-                valid_phones.append(formatted)
+        # Extract title
+        title = None
+        title_elem = soup.find('h1', class_='prodname')
+        if title_elem:
+            title = title_elem.text.strip()
 
-        if not valid_phones:
-            return None
+        # Extract price
+        price = None
+        price_elem = soup.find('span', class_='sprice')
+        if price_elem:
+            price = price_elem.text.strip()
 
-        # Create base item structure
-        base_item = {
-            'name': contact_info.get('name', ''),
-            'website': 'emlak.az',
+        # Extract product code
+        product_code = None
+        code_elem = soup.find('span', class_='id')
+        if code_elem:
+            product_code = code_elem.text.strip()
+
+        # Get seller name (if available)
+        seller_name = "Sebet.az"  # Default to website name since individual seller names aren't shown
+
+        return {
+            'name': seller_name,
+            'phone': formatted_phone,
+            'website': 'sebet.az',
             'link': url,
             'raw_data': {
-                'title': details.get('title'),
-                'price': details.get('price'),
-                'description': details.get('description'),
-                'technical_characteristics': tech_chars
+                'title': title,
+                'price': price,
+                'product_code': product_code
             }
         }
-
-        # Return a list of items, one per valid phone number
-        return [{**base_item, 'phone': phone} for phone in valid_phones]
 
     except Exception as e:
         print(f"Error extracting listing details: {e}")
         return None
 
-def get_listing_links(soup: BeautifulSoup, base_url: str) -> List[str]:
+def get_listing_links(soup: BeautifulSoup) -> List[str]:
     """Extract all listing links from a page"""
     links = []
-    listings = soup.find_all('div', class_='ticket')
+    products = soup.find_all('div', class_='nobj prod')
     
-    for listing in listings:
-        link_elem = listing.find('h6', class_='title').find('a') if listing.find('h6', class_='title') else None
+    for product in products:
+        link_elem = product.find('a')
         if link_elem and link_elem.get('href'):
-            link = urljoin(base_url, link_elem['href'])
+            link = link_elem['href']
+            if not link.startswith('http'):
+                link = urljoin('https://sebet.az', link)
             links.append(link)
     
     return links
@@ -226,26 +180,26 @@ def get_listing_links(soup: BeautifulSoup, base_url: str) -> List[str]:
 def scrape() -> List[Dict]:
     """Main scraping function"""
     session = requests.Session()
-    base_url = "https://emlak.az"
+    base_url = "https://sebet.az/homelist"
     items_to_process = []
     stats = ScraperStats()
     
     try:
-        pages_to_scrape = [1, 2, 3]
+        pages_to_scrape = [1, 2, 3]  # Default to first 3 pages
         stats.total_pages = len(pages_to_scrape)
         print(f"Will scrape {len(pages_to_scrape)} pages")
         
         for page in pages_to_scrape:
             try:
-                url = f"https://emlak.az/elanlar/?ann_type=1&sort_type=0&page={page}"
+                url = f"{base_url}/{page}"
                 print(f"\nProcessing page {page}/{len(pages_to_scrape)}")
                 
                 soup = make_request(session, url)
                 if not soup:
-                    print(f"Failed to get response for page {page}")
+                    print(f"Failed to get response for page {url}")
                     continue
                 
-                listing_links = get_listing_links(soup, base_url)
+                listing_links = get_listing_links(soup)
                 print(f"Found {len(listing_links)} listings on page {page}")
                 
                 for idx, link in enumerate(listing_links, 1):
@@ -257,16 +211,14 @@ def scrape() -> List[Dict]:
                             print(f"Failed to get listing details for {link}")
                             continue
                         
-                        items = extract_listing_details(listing_soup, link)
-                        if items:
-                            items_to_process.extend(items)
-                            stats.valid_numbers += len(items)
-                            if len(items) > 1:
-                                stats.multi_phone_items += 1
-                            print(f"Successfully processed listing with {len(items)} phone numbers")
+                        details = extract_listing_details(listing_soup, link, stats)
+                        if details:
+                            items_to_process.append(details)
+                            stats.valid_numbers += 1
+                            print(f"Successfully processed listing with phone {details['phone']}")
                         else:
                             stats.invalid_numbers += 1
-                            print(f"No valid phone numbers found for listing {link}")
+                            print(f"No valid phone number found for listing {link}")
                             
                         stats.total_listings += 1
                         
@@ -285,3 +237,13 @@ def scrape() -> List[Dict]:
         print(f"Scraping error: {e}")
     
     return items_to_process
+
+if __name__ == "__main__":
+    try:
+        results = scrape()
+        print(f"\nScraping completed. Found {len(results)} valid listings.")
+    except KeyboardInterrupt:
+        print("\nScraping interrupted by user")
+    except Exception as e:
+        print(f"\nError during scraping: {e}")
+        raise

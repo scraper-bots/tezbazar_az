@@ -1,3 +1,4 @@
+# scrapers/ucuztap.py
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
@@ -7,17 +8,11 @@ import random
 import re
 import urllib3
 from typing import Dict, List, Optional, Set
-import psycopg2
-import os
-from dotenv import load_dotenv
 from dataclasses import dataclass
 from urllib.parse import urljoin
 
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# Load environment variables
-load_dotenv()
 
 @dataclass
 class ScraperStats:
@@ -25,8 +20,6 @@ class ScraperStats:
     total_listings: int = 0
     valid_numbers: int = 0
     invalid_numbers: int = 0
-    db_inserts: int = 0
-    db_updates: int = 0
     invalid_phone_list: List[str] = None
 
     def __post_init__(self):
@@ -38,8 +31,6 @@ class ScraperStats:
         print(f"Total listings found: {self.total_listings}")
         print(f"Valid numbers found: {self.valid_numbers}")
         print(f"Invalid numbers found: {self.invalid_numbers}")
-        print(f"New records inserted: {self.db_inserts}")
-        print(f"Records updated: {self.db_updates}")
         if self.invalid_numbers > 0:
             print("\nInvalid phone numbers:")
             for phone in self.invalid_phone_list:
@@ -59,7 +50,6 @@ def get_listing_links_from_sitemap(html_content: str) -> List[str]:
         for div in product_divs:
             link = div.find('a', href=True)
             if link and link.get('href'):
-                # Only add links that match the expected pattern
                 if '/elan/' in link['href']:
                     full_url = link['href']
                     if not full_url.startswith('http'):
@@ -88,24 +78,9 @@ def get_listing_links_from_sitemap(html_content: str) -> List[str]:
 
     except Exception as e:
         print(f"Error parsing HTML: {e}")
-        # Print a snippet of the HTML content for debugging
         print("HTML snippet:")
         print(html_content[:500] + "..." if len(html_content) > 500 else html_content)
         return []
-
-def get_db_connection():
-    """Create database connection"""
-    try:
-        return psycopg2.connect(
-            dbname=os.getenv('DB_NAME'),
-            user=os.getenv('DB_USER'),
-            password=os.getenv('DB_PASSWORD'),
-            host=os.getenv('DB_HOST'),
-            port=os.getenv('DB_PORT')
-        )
-    except Exception as e:
-        print(f"Database connection error: {e}")
-        raise
 
 def format_phone(phone: str, stats: Optional[ScraperStats] = None, original: str = None) -> Optional[str]:
     """Format and validate phone number with relaxed validation"""
@@ -143,7 +118,6 @@ def format_phone(phone: str, stats: Optional[ScraperStats] = None, original: str
         return None
     
     # Special handling for phone format patterns:
-    # For numbers like (050) 200 26 27, we'll accept them as they're common
     if prefix in ('50', '51', '55', '70', '77'):
         pattern = re.compile(r'^(\d{2})([2-9])(\d{2})(\d{2})(\d{2})$')
         if pattern.match(digits):
@@ -152,6 +126,7 @@ def format_phone(phone: str, stats: Optional[ScraperStats] = None, original: str
             
     print(f"Valid phone number: {digits}")    
     return digits
+
 def get_headers() -> Dict[str, str]:
     """Get randomized headers"""
     user_agents = [
@@ -176,14 +151,14 @@ def make_request(session: requests.Session, url: str, max_retries: int = 3) -> O
     """Make HTTP request with retries and error handling"""
     for attempt in range(max_retries):
         try:
-            time.sleep(random.uniform(1.5, 3))  # Longer random delay
+            time.sleep(random.uniform(1.5, 3))
             print(f"Making request attempt {attempt + 1} for: {url}")
             
             response = session.get(
                 url, 
                 headers=get_headers(), 
                 timeout=15,
-                verify=False  # Disable SSL verification
+                verify=False
             )
             
             if response.status_code == 200:
@@ -217,7 +192,6 @@ def extract_phone_number(soup: BeautifulSoup) -> Optional[str]:
         for elem in strong_elements:
             print(f"Found strong element with fs-20 class: {elem}")
             
-            # Get text before WhatsApp image if present
             phone_text = ''
             for content in elem.contents:
                 if isinstance(content, str):
@@ -251,10 +225,9 @@ def extract_phone_number(soup: BeautifulSoup) -> Optional[str]:
             if cleaned:
                 phone_numbers.add(cleaned)
 
-        # Print all found numbers for debugging
         if phone_numbers:
             print(f"Found phone numbers: {phone_numbers}")
-            return next(iter(phone_numbers))  # Return first valid number
+            return next(iter(phone_numbers))
             
         print("No phone numbers found")
         return None
@@ -288,14 +261,13 @@ def extract_listing_details(soup: BeautifulSoup, url: str, stats: ScraperStats) 
             return None
         print(f"Raw phone: {raw_phone}")
             
-        # Format and validate phone number
         formatted_phone = format_phone(raw_phone, stats, raw_phone)
         if not formatted_phone:
             print("Invalid phone number format")
             return None
         print(f"Formatted phone: {formatted_phone}")
 
-        # Extract other details (keeping the rest of your existing extraction code)
+        # Extract other details
         seller_name = None
         shop_elem = soup.find('h3', class_='m-t-1')
         if shop_elem:
@@ -328,84 +300,8 @@ def extract_listing_details(soup: BeautifulSoup, url: str, stats: ScraperStats) 
         print(f"Error extracting listing details from {url}: {e}")
         return None
 
-def save_to_db(items: List[Dict], stats: Optional[ScraperStats] = None) -> None:
-    """Save scraped items to database with improved error handling"""
-    if stats is None:
-        stats = ScraperStats()
-        
-    max_retries = 3
-    retry_delay = 5
-    
-    for attempt in range(max_retries):
-        conn = None
-        cursor = None
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            for item in items:
-                try:
-                    query = """
-                        INSERT INTO leads (name, phone, website, link, scraped_at, raw_data)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (phone) DO UPDATE
-                        SET name = EXCLUDED.name,
-                            website = EXCLUDED.website,
-                            link = EXCLUDED.link,
-                            scraped_at = EXCLUDED.scraped_at,
-                            raw_data = EXCLUDED.raw_data
-                        RETURNING (xmax = 0) AS inserted;
-                    """
-                    
-                    values = (
-                        item['name'],
-                        item['phone'],
-                        item['website'],
-                        item['link'],
-                        datetime.now(),
-                        json.dumps(item['raw_data'], ensure_ascii=False)
-                    )
-                    
-                    cursor.execute(query, values)
-                    is_insert = cursor.fetchone()[0]
-                    
-                    if is_insert:
-                        stats.db_inserts += 1
-                        print(f"New number inserted: {item['phone']}")
-                    else:
-                        stats.db_updates += 1
-                        print(f"Number updated: {item['phone']}")
-                        
-                    conn.commit()
-                    
-                except psycopg2.Error as e:
-                    print(f"Error saving item to database: {e}")
-                    conn.rollback()
-                    continue
-                    
-            return
-                
-        except psycopg2.Error as e:
-            print(f"Database error (attempt {attempt + 1}/{max_retries}): {e}")
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay)
-                continue
-            raise
-            
-        finally:
-            if cursor:
-                cursor.close()
-            if conn:
-                try:
-                    conn.close()
-                except Exception as e:
-                    print(f"Error closing connection: {e}")
-                    
-    raise Exception("Failed to save items to database after all retries")
-
 def scrape() -> List[Dict]:
     """Main scraping function"""
-    # Create session with SSL verification disabled
     session = requests.Session()
     session.verify = False
     
@@ -435,13 +331,11 @@ def scrape() -> List[Dict]:
                 new_urls = [url for url in listing_urls if url not in processed_urls]
                 print(f"Found {len(new_urls)} new listings on page {page}")
                 
-                # Process each listing
                 for idx, url in enumerate(new_urls, 1):
                     try:
                         if url in processed_urls:
                             continue
                             
-                        # Ensure full URL
                         if not url.startswith('http'):
                             url = urljoin('https://ucuztap.az', url)
                             
@@ -480,16 +374,6 @@ def scrape() -> List[Dict]:
         
         # Print final statistics
         stats.print_summary()
-        
-        if items_to_process:
-            print(f"\nAttempting to save {len(items_to_process)} items to database")
-            try:
-                save_to_db(items_to_process, stats)
-                print("Successfully saved items to database")
-            except Exception as e:
-                print(f"Failed to save items to database: {e}")
-        else:
-            print("\nNo items to save to database")
         
     except Exception as e:
         print(f"Scraping error: {e}")

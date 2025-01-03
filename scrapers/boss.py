@@ -7,13 +7,7 @@ import time
 import random
 import re
 from typing import Dict, List, Optional
-import psycopg2
-import os
-from dotenv import load_dotenv
 from dataclasses import dataclass
-
-# Load environment variables
-load_dotenv()
 
 @dataclass
 class ScraperStats:
@@ -21,24 +15,24 @@ class ScraperStats:
     total_listings: int = 0
     valid_numbers: int = 0
     invalid_numbers: int = 0
-    db_inserts: int = 0
-    db_updates: int = 0
     invalid_phone_list: List[str] = None
 
     def __post_init__(self):
         self.invalid_phone_list = []
 
-def get_db_connection():
-    """Create database connection"""
-    return psycopg2.connect(
-        dbname=os.getenv('DB_NAME'),
-        user=os.getenv('DB_USER'),
-        password=os.getenv('DB_PASSWORD'),
-        host=os.getenv('DB_HOST'),
-        port=os.getenv('DB_PORT')
-    )
+    def print_summary(self):
+        """Print scraping statistics summary"""
+        print("\nScraping Statistics:")
+        print(f"Total pages processed: {self.total_pages}")
+        print(f"Total listings found: {self.total_listings}")
+        print(f"Valid numbers: {self.valid_numbers}")
+        print(f"Invalid numbers: {self.invalid_numbers}")
+        if self.invalid_numbers > 0:
+            print("\nInvalid phone numbers:")
+            for phone in self.invalid_phone_list:
+                print(f"  {phone}")
 
-def format_phone(phone: str, stats: ScraperStats, original: str = None) -> Optional[str]:
+def format_phone(phone: str, stats: Optional[ScraperStats] = None, original: str = None) -> Optional[str]:
     """Format and validate phone number according to rules"""
     if not phone:
         return None
@@ -215,52 +209,6 @@ def get_listing_links(soup: BeautifulSoup) -> List[str]:
     
     return links
 
-def save_to_db(conn, items: List[Dict], stats: ScraperStats) -> None:
-    """Save scraped items to database"""
-    cursor = conn.cursor()
-    
-    for item in items:
-        try:
-            query = """
-                INSERT INTO leads (name, phone, website, link, scraped_at, raw_data)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (phone) DO UPDATE
-                SET name = EXCLUDED.name,
-                    website = EXCLUDED.website,
-                    link = EXCLUDED.link,
-                    scraped_at = EXCLUDED.scraped_at,
-                    raw_data = EXCLUDED.raw_data
-                RETURNING (xmax = 0) AS inserted;
-            """
-            
-            values = (
-                item['name'],
-                item['phone'],
-                item['website'],
-                item['link'],
-                datetime.now(),
-                json.dumps(item['raw_data'], ensure_ascii=False)
-            )
-            
-            cursor.execute(query, values)
-            is_insert = cursor.fetchone()[0]
-            
-            if is_insert:
-                stats.db_inserts += 1
-                print(f"New number inserted: {item['phone']}")
-            else:
-                stats.db_updates += 1
-                print(f"Number updated: {item['phone']}")
-                
-            conn.commit()
-            
-        except Exception as e:
-            print(f"Error saving item to database: {e}")
-            conn.rollback()
-            continue
-            
-    cursor.close()
-
 def scrape() -> List[Dict]:
     """Main scraping function"""
     session = requests.Session()
@@ -316,27 +264,9 @@ def scrape() -> List[Dict]:
             except Exception as e:
                 print(f"Error processing page {page}: {e}")
                 continue
-        
-        # Save all items to database
-        if items_to_process:
-            conn = get_db_connection()
-            try:
-                save_to_db(conn, items_to_process, stats)
-            finally:
-                conn.close()
-        
+
         # Print final statistics
-        print("\nScraping Statistics:")
-        print(f"Total pages processed: {stats.total_pages}")
-        print(f"Total listings found: {stats.total_listings}")
-        print(f"Valid numbers: {stats.valid_numbers}")
-        print(f"Invalid numbers: {stats.invalid_numbers}")
-        print(f"New records inserted: {stats.db_inserts}")
-        print(f"Records updated: {stats.db_updates}")
-        if stats.invalid_numbers > 0:
-            print("\nInvalid phone numbers:")
-            for phone in stats.invalid_phone_list:
-                print(f"  {phone}")
+        stats.print_summary()
         
     except Exception as e:
         print(f"Scraping error: {e}")

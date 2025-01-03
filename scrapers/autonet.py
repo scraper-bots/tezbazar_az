@@ -1,4 +1,3 @@
-# scrapers/autonet.py
 import requests
 from datetime import datetime
 import json
@@ -6,37 +5,20 @@ import time
 import random
 import re
 from typing import Dict, List, Optional, Tuple
-import psycopg2
-import os
-from dotenv import load_dotenv
 from dataclasses import dataclass
-
-# Load environment variables
-load_dotenv()
-
-def get_db_connection():
-    return psycopg2.connect(
-        dbname=os.getenv('DB_NAME'),
-        user=os.getenv('DB_USER'),
-        password=os.getenv('DB_PASSWORD'),
-        host=os.getenv('DB_HOST'),
-        port=os.getenv('DB_PORT')
-    )
 
 @dataclass
 class ScraperStats:
     total_items: int = 0
     valid_numbers: int = 0
     invalid_numbers: int = 0
-    db_inserts: int = 0
-    db_updates: int = 0
     multi_phone_items: int = 0
     invalid_phone_list: List[str] = None
 
     def __post_init__(self):
         self.invalid_phone_list = []
 
-def format_phone(phone: str, stats: ScraperStats, original: str = None) -> Optional[str]:
+def format_phone(phone: str, stats: Optional[ScraperStats] = None, original: str = None) -> Optional[str]:
     """Format and validate phone number according to rules"""
     if not phone:
         return None
@@ -120,53 +102,11 @@ def make_request(session: requests.Session, url: str, max_retries: int = 3) -> O
     
     return None
 
-def insert_lead(cursor, item: Dict, phone: str, stats: ScraperStats) -> None:
-    """Insert or update a single lead in the database"""
-    try:
-        query = """
-            INSERT INTO leads (name, phone, website, link, scraped_at, raw_data)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (phone) DO UPDATE
-            SET name = EXCLUDED.name,
-                website = EXCLUDED.website,
-                link = EXCLUDED.link,
-                scraped_at = EXCLUDED.scraped_at,
-                raw_data = EXCLUDED.raw_data
-            RETURNING (xmax = 0) AS inserted;
-        """
-        
-        values = (
-            item.get('fullname'),
-            phone,
-            'autonet.az',
-            f"https://autonet.az/items/{item.get('id')}",
-            datetime.now(),
-            json.dumps(item, ensure_ascii=False)
-        )
-        
-        cursor.execute(query, values)
-        is_insert = cursor.fetchone()[0]
-        
-        if is_insert:
-            stats.db_inserts += 1
-            print(f"New number inserted: {phone}")
-        else:
-            stats.db_updates += 1
-            print(f"Number updated: {phone}")
-            
-        return True
+def process_items(raw_items: List[Dict], stats: ScraperStats) -> List[Dict]:
+    """Process raw items and format them for database insertion"""
+    processed_items = []
     
-    except Exception as e:
-        print(f"Error inserting/updating lead: {e}")
-        return False
-
-def save_to_db(conn, items: List[Dict]) -> None:
-    """Save scraped items to database, handling multiple phone numbers per item"""
-    stats = ScraperStats()
-    cursor = conn.cursor()
-    stats.total_items = len(items)
-    
-    for item in items:
+    for item in raw_items:
         try:
             # Format and validate both phone numbers
             phone1 = format_phone(item.get('phone1'), stats, item.get('phone1'))
@@ -194,29 +134,31 @@ def save_to_db(conn, items: List[Dict]) -> None:
             if len(valid_phones) > 1:
                 stats.multi_phone_items += 1
             
-            # Insert each valid phone number as a separate row
+            # Create an item for each valid phone number
             for phone in valid_phones:
-                success = insert_lead(cursor, item, phone, stats)
-                if success:
-                    conn.commit()
-                else:
-                    conn.rollback()
+                processed_item = {
+                    'name': item.get('fullname'),
+                    'phone': phone,
+                    'website': 'autonet.az',
+                    'link': f"https://autonet.az/items/{item.get('id')}",
+                    'raw_data': item
+                }
+                processed_items.append(processed_item)
+                print(f"Processed item with phone {phone}")
                 
         except Exception as e:
             print(f"Error processing item: {e}")
-            conn.rollback()
             continue
             
-    cursor.close()
-    
-    # Print statistics
+    return processed_items
+
+def print_stats(stats: ScraperStats) -> None:
+    """Print scraping statistics"""
     print("\nScraping Statistics:")
     print(f"Total items processed: {stats.total_items}")
     print(f"Total valid numbers: {stats.valid_numbers}")
     print(f"Total invalid numbers: {stats.invalid_numbers}")
     print(f"Items with multiple phones: {stats.multi_phone_items}")
-    print(f"New records inserted: {stats.db_inserts}")
-    print(f"Records updated: {stats.db_updates}")
     if stats.invalid_numbers > 0:
         print("\nInvalid phone numbers:")
         for phone in stats.invalid_phone_list:
@@ -226,7 +168,7 @@ def scrape() -> List[Dict]:
     """Main scraping function"""
     session = requests.Session()
     base_url = "https://autonet.az/api/items/searchItem"
-    items_to_process = []
+    stats = ScraperStats()
     
     try:
         # Get first page to determine total pages
@@ -242,11 +184,12 @@ def scrape() -> List[Dict]:
         pages_to_scrape = [1, 2, 3]  # Explicitly define which pages to scrape
         print(f"Will scrape pages: {pages_to_scrape}")
         
+        raw_items = []
         # Process specified pages
         for page in pages_to_scrape:
             try:
                 url = f"{base_url}?page={page}"
-                print(f"\nProcessing page {page}/{pages_to_scrape}")
+                print(f"\nProcessing page {page}/{len(pages_to_scrape)}")
                 
                 response = make_request(session, url)
                 if not response:
@@ -256,21 +199,21 @@ def scrape() -> List[Dict]:
                 page_items = response.get('data', [])
                 print(f"Found {len(page_items)} items on page {page}")
                 
-                items_to_process.extend(page_items)
+                raw_items.extend(page_items)
                 
             except Exception as e:
                 print(f"Error processing page {page}: {e}")
                 continue
         
-        # Save all items to database
-        if items_to_process:
-            conn = get_db_connection()
-            try:
-                save_to_db(conn, items_to_process)
-            finally:
-                conn.close()
+        # Process all collected items
+        stats.total_items = len(raw_items)
+        processed_items = process_items(raw_items, stats)
+        
+        # Print final statistics
+        print_stats(stats)
+        
+        return processed_items
         
     except Exception as e:
         print(f"Scraping error: {e}")
-    
-    return items_to_process  # Return items for main script to handle
+        return []
