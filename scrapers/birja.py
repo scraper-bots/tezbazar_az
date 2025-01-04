@@ -1,294 +1,220 @@
-import requests
-from bs4 import BeautifulSoup
+import aiohttp
+import asyncio
+from bs4 import BeautifulSoup, SoupStrainer
 from datetime import datetime
-import json
-import time
-import random
 import re
-import concurrent.futures
-from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 from urllib.parse import urljoin
+import pandas as pd
+from pathlib import Path
+import logging
+import time
+import argparse
 
-@dataclass
-class ScraperStats:
-    total_categories: int = 0
-    total_listings: int = 0
-    valid_numbers: int = 0
-    invalid_numbers: int = 0
-    invalid_phone_list: List[str] = None
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-    def __post_init__(self):
-        self.invalid_phone_list = []
-
-    def print_stats(self):
-        """Print scraping statistics"""
-        print("\nScraping Statistics:")
-        print(f"Total categories processed: {self.total_categories}")
-        print(f"Total listings found: {self.total_listings}")
-        print(f"Valid numbers: {self.valid_numbers}")
-        print(f"Invalid numbers: {self.invalid_numbers}")
-        if self.invalid_numbers > 0:
-            print("\nInvalid phone numbers:")
-            for phone in self.invalid_phone_list:
-                print(f"  {phone}")
-
-def format_phone(phone: str, stats: Optional[ScraperStats] = None, original: str = None) -> Optional[str]:
-    """Format and validate phone number according to rules"""
-    if not phone:
-        return None
+class BirjaScraper:
+    def __init__(self, test_mode=False, max_pages=None, category_limit=None):
+        """
+        Initialize scraper with test options:
+        test_mode: If True, only scrapes first page of each category
+        max_pages: Limit pages per category (None for all pages)
+        category_limit: Limit number of categories to scrape (None for all)
+        """
+        self.base_url = "https://birja.com/all_category/az"
+        self.session = None
+        self.batch_size = 5000  # Can be adjusted: smaller for testing, larger for production
+        self.data = []
+        self.processed_urls: Set[str] = set()
+        self.sem = asyncio.Semaphore(100)  # Can be adjusted: 100 for production, 10 for testing
+        self.connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
+        self.data_dir = Path('data')
+        self.data_dir.mkdir(exist_ok=True)
         
-    digits = re.sub(r'\D', '', phone)
-    if digits.startswith('994'): 
-        digits = digits[3:]
-    if digits.startswith('0'): 
-        digits = digits[1:]
-    
-    if len(digits) != 9:
-        if stats:
-            stats.invalid_phone_list.append(f"Length error - Original: {original}, Cleaned: {digits}")
-        return None
-    
-    if not digits.startswith(('10', '12', '50', '51', '55', '60', '70', '77', '99')):
-        if stats:
-            stats.invalid_phone_list.append(f"Prefix error - Original: {original}, Cleaned: {digits}")
-        return None
-    
-    if digits[3] in ('0', '1'):
-        if stats:
-            stats.invalid_phone_list.append(f"Fourth digit error - Original: {original}, Cleaned: {digits}")
-        return None
+        # Test mode settings
+        self.test_mode = test_mode
+        self.max_pages = max_pages if not test_mode else 1
+        self.category_limit = category_limit
         
-    return digits
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        }
 
-def get_headers() -> Dict[str, str]:
-    """Get randomized headers"""
-    user_agents = [
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    ]
-    return {
-        'User-Agent': random.choice(user_agents),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Connection': 'keep-alive'
-    }
+    def format_phone(self, phone: str) -> Optional[str]:
+        if not phone:
+            return None
+        digits = ''.join(c for c in phone if c.isdigit())
+        if digits.startswith('994'): digits = digits[3:]
+        if digits.startswith('0'): digits = digits[1:]
+        return digits if len(digits) == 9 and digits[:2] in ('10','12','50','51','55','60','70','77','99') else None
 
-def make_request(session: requests.Session, url: str, max_retries: int = 3) -> Optional[BeautifulSoup]:
-    """Make HTTP request with retries and random delays"""
-    for attempt in range(max_retries):
-        try:
-            time.sleep(random.uniform(1, 2))
-            response = session.get(url, headers=get_headers(), timeout=10)
-            
-            if response.status_code == 200:
-                return BeautifulSoup(response.text, 'html.parser')
-            
-            print(f"Got status code {response.status_code} for {url}")
-            
-        except Exception as e:
-            print(f"Request error (attempt {attempt + 1}/{max_retries}): {str(e)}")
-            if attempt == max_retries - 1:
-                raise
-            time.sleep(random.uniform(2, 4))
-    
-    return None
+    async def fetch_page(self, url: str) -> Optional[str]:
+        async with self.sem:
+            try:
+                async with self.session.get(url, headers=self.headers) as response:
+                    if response.status == 200:
+                        return await response.text()
+            except Exception as e:
+                logger.debug(f"Error fetching {url}: {e}")
+            return None
 
-def get_categories(session: requests.Session) -> List[Dict]:
-    """Get all category links from the main categories page"""
-    base_url = "https://birja.com/all_category/az"
-    categories = []
-    
-    try:
-        soup = make_request(session, base_url)
-        if not soup:
+    async def get_categories(self) -> List[Dict]:
+        if html := await self.fetch_page(self.base_url):
+            soup = BeautifulSoup(html, 'html.parser', parse_only=SoupStrainer(['div', 'h4', 'a']))
+            categories = []
+            
+            for section in soup.find_all('div', class_='col-md-3'):
+                if h4 := section.find('h4'):
+                    cat_name = h4.text.strip()
+                    for link in section.find_all('a', href=True):
+                        categories.append({
+                            'title': cat_name,
+                            'name': link.text.strip(),
+                            'url': urljoin(self.base_url, link['href'])
+                        })
+            
+            if self.category_limit:
+                categories = categories[:self.category_limit]
+                
+            logger.info(f"Found {len(categories)} categories" + 
+                       (f" (limited to {self.category_limit})" if self.category_limit else ""))
             return categories
-            
-        for section in soup.find_all('div', class_='col-md-3'):
-            category_title = section.find('h4')
-            if not category_title:
-                continue
-                
-            for link in section.find_all('a'):
-                href = link.get('href')
-                if href:
-                    categories.append({
-                        'title': category_title.text.strip(),
-                        'name': link.text.strip(),
-                        'url': urljoin(base_url, href)
-                    })
-                    
-        print(f"Found {len(categories)} categories")
-        return categories
-        
-    except Exception as e:
-        print(f"Error getting categories: {e}")
-        return categories
-
-def get_pagination_urls(soup: BeautifulSoup, base_url: str) -> List[str]:
-    """Extract pagination URLs from category page"""
-    urls = []
-    try:
-        pagination = soup.find('ul', class_='pagination')
-        if not pagination:
-            return [base_url]
-            
-        for link in pagination.find_all('a'):
-            href = link.get('href')
-            if href and href != '#':
-                urls.append(urljoin(base_url, href))
-                
-        return list(set(urls))
-        
-    except Exception as e:
-        print(f"Error getting pagination: {e}")
-        return [base_url]
-
-def get_listing_urls(soup: BeautifulSoup, base_url: str) -> List[str]:
-    """Extract listing URLs from category page"""
-    urls = []
-    try:
-        listings = soup.find_all('div', class_='cs_card_col')
-        for listing in listings:
-            link = listing.find('a', class_='cs_card_img')
-            if link and link.get('href'):
-                urls.append(urljoin(base_url, link['href']))
-                
-        return urls
-        
-    except Exception as e:
-        print(f"Error getting listing URLs: {e}")
         return []
 
-def process_listing(session: requests.Session, url: str, stats: ScraperStats) -> Optional[Dict]:
-    """Process a single listing page"""
-    try:
-        soup = make_request(session, url)
-        if not soup:
-            return None
-            
-        title = soup.find('h1')
-        title_text = title.text.strip() if title else ''
-        
-        user_name = None
-        phone = None
-        price = None
-        description = ''
-        
-        info_table = soup.find('table', class_='table')
-        if info_table:
-            for row in info_table.find_all('tr'):
-                label_cell = row.find('td', width='35%')
-                if not label_cell:
-                    continue
-                    
-                label = label_cell.find('strong').text.strip() if label_cell.find('strong') else ''
-                value_cell = label_cell.find_next_sibling('td')
-                if not value_cell:
-                    continue
+    async def get_listing_urls(self, category_url: str, page: int = 1) -> List[str]:
+        if html := await self.fetch_page(f"{category_url}/{page}"):
+            parser = BeautifulSoup(html, 'html.parser', parse_only=SoupStrainer('a', class_='cs_card_img'))
+            return [
+                urljoin(self.base_url, a['href']) 
+                for a in parser.find_all('a', href=True)
+                if (url := urljoin(self.base_url, a['href'])) not in self.processed_urls 
+                and not self.processed_urls.add(url)
+            ]
+        return []
+
+    async def process_listing(self, url: str) -> Optional[Dict]:
+        if html := await self.fetch_page(url):
+            try:
+                soup = BeautifulSoup(html, 'html.parser', parse_only=SoupStrainer(['h1', 'table', 'div']))
+                result = {'url': url, 'scrape_date': datetime.now().isoformat()}
                 
-                if 'İstifadəçi' in label:
-                    user_name = value_cell.text.strip()
-                elif 'Mobil' in label:
-                    phone_link = value_cell.find('a')
-                    if phone_link:
-                        phone = phone_link.text.strip()
-                elif 'Qiymət' in label:
-                    price = value_cell.text.strip()
-                        
-        desc_elem = soup.find('p')
-        if desc_elem:
-            description = desc_elem.text.strip()
-            
-        formatted_phone = format_phone(phone, stats, phone)
-        if formatted_phone:
-            stats.valid_numbers += 1
-            return {
-                'name': user_name,
-                'phone': formatted_phone,
-                'website': 'birja.com',
-                'link': url,
-                'raw_data': {
-                    'title': title_text,
-                    'price': price,
-                    'description': description
-                }
-            }
-        else:
-            stats.invalid_numbers += 1
-            return None
-            
-    except Exception as e:
-        print(f"Error processing listing {url}: {e}")
+                if title := soup.find('h1'):
+                    result['title'] = title.text.strip()
+                
+                if table := soup.find('table', class_='table'):
+                    for row in table.find_all('tr'):
+                        cols = row.find_all(['td', 'th'])
+                        if len(cols) >= 2:
+                            key = cols[0].text.strip().replace(':', '')
+                            value = cols[1].text.strip()
+                            
+                            if phone_link := cols[1].find('a', href=lambda x: x and 'tel:' in x):
+                                raw_phone = phone_link.text.strip()
+                                if formatted := self.format_phone(raw_phone):
+                                    result['phone'] = formatted
+                                    result['raw_phone'] = raw_phone
+                            
+                            result[key.lower()] = value
+                
+                if desc := soup.select_one('div.col-md-6 p'):
+                    result['description'] = desc.text.strip()
+                
+                return result if result.get('phone') else None
+            except Exception as e:
+                logger.debug(f"Error processing {url}: {e}")
         return None
 
-def scrape_category(session: requests.Session, category: Dict, stats: ScraperStats) -> List[Dict]:
-    """Scrape all listings in a category"""
-    items = []
-    try:
-        soup = make_request(session, category['url'])
-        if not soup:
-            return items
-            
-        pagination_urls = get_pagination_urls(soup, category['url'])
-        print(f"Found {len(pagination_urls)} pages in category {category['name']}")
-        
-        for page_url in pagination_urls:
-            try:
-                page_soup = make_request(session, page_url)
-                if not page_soup:
-                    continue
-                    
-                listing_urls = get_listing_urls(page_soup, page_url)
-                print(f"Found {len(listing_urls)} listings on page {page_url}")
-                
-                for listing_url in listing_urls:
-                    try:
-                        item = process_listing(session, listing_url, stats)
-                        if item:
-                            items.append(item)
-                            stats.total_listings += 1
-                            
-                    except Exception as e:
-                        print(f"Error processing listing {listing_url}: {e}")
-                        continue
-                    
-            except Exception as e:
-                print(f"Error processing page {page_url}: {e}")
-                continue
-                
-        return items
-        
-    except Exception as e:
-        print(f"Error scraping category {category['name']}: {e}")
-        return items
+    async def process_batch(self, batch_data: List[Dict]):
+        if batch_data:
+            df = pd.DataFrame(batch_data)
+            filename = self.data_dir / f'listings_{datetime.now():%Y%m%d_%H%M%S}.csv'
+            df.to_csv(filename, index=False, encoding='utf-8')
+            logger.info(f"Saved {len(batch_data)} listings to {filename}")
 
-def scrape() -> List[Dict]:
-    """Main scraping function"""
-    session = requests.Session()
-    stats = ScraperStats()
-    all_items = []
-    
-    try:
-        categories = get_categories(session)
-        stats.total_categories = len(categories)
-        print(f"Starting scrape of {len(categories)} categories")
+    async def scrape_category(self, category: Dict) -> List[Dict]:
+        listings = []
+        page = 1
+        page_count = 0
         
-        for category in categories:
-            try:
-                print(f"\nProcessing category: {category['name']}")
-                items = scrape_category(session, category, stats)
-                if items:
-                    all_items.extend(items)
-                    
-            except Exception as e:
-                print(f"Error processing category {category['name']}: {e}")
-                continue
+        while True:
+            if self.max_pages and page > self.max_pages:
+                break
                 
-        stats.print_stats()
+            if not (urls := await self.get_listing_urls(category['url'], page)):
+                break
+            
+            tasks = [self.process_listing(url) for url in urls]
+            results = await asyncio.gather(*tasks)
+            if valid := [r for r in results if r]:
+                listings.extend(valid)
+                page_count += 1
+                logger.info(f"Category '{category['name']}': Page {page} - Found {len(valid)} listings")
+            
+            if self.test_mode:
+                break
+                
+            page += 1
         
-    except Exception as e:
-        print(f"Scraping error: {e}")
-        raise
-        
-    return all_items
+        logger.info(f"Finished category '{category['name']}' - {len(listings)} total listings from {page_count} pages")
+        return listings
+
+    async def scrape(self):
+        async with aiohttp.ClientSession(connector=self.connector) as session:
+            self.session = session
+            start = time.time()
+            
+            if not (categories := await self.get_categories()):
+                return
+            
+            chunk_size = 20  # Production: 20, Testing: 5
+            total = 0
+            
+            for i in range(0, len(categories), chunk_size):
+                chunk = categories[i:i + chunk_size]
+                tasks = [self.scrape_category(cat) for cat in chunk]
+                
+                for listings in await asyncio.gather(*tasks):
+                    if listings:
+                        total += len(listings)
+                        self.data.extend(listings)
+                        
+                        while len(self.data) >= self.batch_size:
+                            batch, self.data = self.data[:self.batch_size], self.data[self.batch_size:]
+                            await self.process_batch(batch)
+                            elapsed = time.time() - start
+                            logger.info(f"Progress: {total:,} listings ({total/elapsed:.1f}/sec)")
+            
+            if self.data:
+                await self.process_batch(self.data)
+            
+            logger.info(f"Scraping completed: {total:,} listings in {time.time() - start:.1f}s")
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Birja.com Scraper')
+    parser.add_argument('--test', action='store_true', help='Run in test mode (1 page per category)')
+    parser.add_argument('--max-pages', type=int, help='Maximum pages per category')
+    parser.add_argument('--category-limit', type=int, help='Limit number of categories')
+    return parser.parse_args()
+
+async def main():
+    args = parse_args()
+    
+    # Uncomment configuration options as needed:
+    scraper = BirjaScraper(
+        test_mode=args.test,  # True for testing, False for production
+        max_pages=args.max_pages,  # None for all pages, or set a number
+        category_limit=args.category_limit  # None for all categories, or set a number
+    )
+    
+    await scraper.scrape()
+
+if __name__ == "__main__":
+    # Usage examples:
+    # Full scrape:     python3 scrapers/birja.py
+    # Test mode:       python3 scrapers/birja.py --test
+    # Limited pages:   python3 scrapers/birja.py --max-pages 5
+    # Limited cats:    python3 scrapers/birja.py --category-limit 3
+    # Combined:        python scraper.py --test --category-limit 2
+    asyncio.run(main())
