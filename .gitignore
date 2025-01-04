@@ -4,7 +4,7 @@ __pycache__/
 *$py.class
 
 .vscode
-*.csv
+# *.csv
 # C extensions
 *.so
 
@@ -172,4 +172,4 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
-.codegpt
+.codegptdata/listings_*.csv
