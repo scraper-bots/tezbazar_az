@@ -11,8 +11,8 @@ from bs4 import BeautifulSoup
 import json
 import re
 import time
+import csv
 from urllib.parse import urljoin
-import pandas as pd
 from typing import Dict, List, Optional, Set
 import logging
 from dataclasses import dataclass, asdict
@@ -443,28 +443,37 @@ class AsyncTebazarScraper:
         
         # Save to CSV
         csv_file = f"{filename_base}.csv"
-        csv_data = []
         
-        for listing in self.scraped_listings:
-            csv_data.append({
-                'listing_id': listing.listing_id,
-                'title': listing.title,
-                'price': listing.price,
-                'location': listing.location,
-                'category': listing.category,
-                'room_count': listing.room_count,
-                'area': listing.area,
-                'floor': listing.floor,
-                'phone': listing.phone,
-                'seller_name': listing.seller_name,
-                'date_posted': listing.date_posted,
-                'description': listing.description[:500],  # Truncate for CSV
-                'image_count': len(listing.images),
-                'url': listing.url
-            })
+        # Define CSV headers
+        headers = [
+            'listing_id', 'title', 'price', 'location', 'category',
+            'room_count', 'area', 'floor', 'phone', 'seller_name',
+            'date_posted', 'description', 'image_count', 'url'
+        ]
         
-        df = pd.DataFrame(csv_data)
-        df.to_csv(csv_file, index=False, encoding='utf-8')
+        # Write CSV file
+        with open(csv_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader()
+            
+            for listing in self.scraped_listings:
+                writer.writerow({
+                    'listing_id': listing.listing_id,
+                    'title': listing.title,
+                    'price': listing.price,
+                    'location': listing.location,
+                    'category': listing.category,
+                    'room_count': listing.room_count,
+                    'area': listing.area,
+                    'floor': listing.floor,
+                    'phone': listing.phone,
+                    'seller_name': listing.seller_name,
+                    'date_posted': listing.date_posted,
+                    'description': listing.description[:500] if listing.description else '',  # Truncate for CSV
+                    'image_count': len(listing.images),
+                    'url': listing.url
+                })
+        
         logger.info(f"💾 Saved to {csv_file}")
 
 

@@ -180,8 +180,9 @@ async def custom_scrape():
 - `aiohttp` - Async HTTP client
 - `aiofiles` - Async file operations
 - `beautifulsoup4` - HTML parsing
-- `pandas` - CSV export
+- `lxml` - Fast XML/HTML parser
 - `asyncio` - Built-in async framework
+- `csv` - Built-in CSV handling
 
 ## 📈 Scaling
 
